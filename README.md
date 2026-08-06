@@ -6,6 +6,10 @@
 [![CI](https://github.com/megatron54/ai-track-engineer/actions/workflows/ci.yml/badge.svg)](https://github.com/megatron54/ai-track-engineer/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![uv](https://img.shields.io/badge/uv-package%20manager-DE5FE9)](https://docs.astral.sh/uv/)
+[![Ollama](https://img.shields.io/badge/AI-Ollama%20(local)-black?logo=ollama&logoColor=white)](https://ollama.com)
+[![scikit-learn](https://img.shields.io/badge/scikit--learn-F7931E?logo=scikit-learn&logoColor=white)](https://scikit-learn.org/)
 
 AI-TrackEngineer captures real-time telemetry from Assetto Corsa through the
 Shared Memory API, analyses driving performance lap-by-lap and corner-by-corner,
@@ -96,3 +100,8 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for the full workflow.
 
 This is an independent, fan-made project. It is not affiliated with or endorsed
 by Kunos Simulazioni. "Assetto Corsa" is a trademark of its respective owner.
+
+## Autor
+
+**Miguel Serra Ferrando** — Telecommunications Engineer
+[GitHub](https://github.com/megatron54) · [LinkedIn](https://www.linkedin.com/in/miguel-serra-ferrando) · [Email](mailto:miguel.serra.ferrando@gmail.com)
