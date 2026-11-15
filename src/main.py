@@ -97,22 +97,30 @@ def coach_replay(
     track: str = typer.Option("nd_buttonwillow"),
     layout: str = typer.Option("layout_classic_13"),
     car: str = typer.Option("ks_mazda_miata"),
+    track_dir: Annotated[
+        Path | None, typer.Option(help="Track folder for edges (default: AC install).")
+    ] = None,
     offline: bool = typer.Option(False, "--offline", help="No Claude calls."),
-    voice: bool = typer.Option(False, "--voice", help="Speak calls (Mac/Windows)."),
+    voice: bool = typer.Option(False, "--voice", help="Speak (Mac/Windows)."),
     realtime: float = typer.Option(0.0, help="Playback speed; 0 = as fast as possible."),
     max_laps: int = typer.Option(0, help="Stop after this many laps (0 = all)."),
 ) -> None:  # pragma: no cover - integration
     """Run the coach over a recorded session, printing what it would say."""
     from src.coach.reference import load_reference, reference_path
-    from src.coach.runner import build_coach, replay
-    from src.coach.samples import read_samples_csv
+    from src.coach.runner import build_coach, prepare_notes, replay
+    from src.coach.samples import CSV_COLUMNS, read_samples_csv
     from src.coach.speaker import make_speaker
+    from src.knowledge.track_edges import load_edges
 
     settings = get_settings()
     configure_logging(settings.app.log_level)
     reference = load_reference(reference_path(settings.coach.reference_dir, track, layout, car))
     speaker = make_speaker(enabled=voice, rate=settings.coach.voice_rate)
-    log_path = Path(settings.coach.sessions_dir) / f"replay_{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    log_path = Path(settings.coach.sessions_dir) / f"replay_{stamp}.jsonl"
+    if track_dir is None:
+        ac_path = find_ac_install(settings.app.ac_install_path)
+        track_dir = Path(ac_path) / "content" / "tracks" / track if ac_path else Path(track)
     coach = build_coach(
         settings.coach,
         track=_coach_track(track, layout),
@@ -120,6 +128,7 @@ def coach_replay(
         speaker=speaker,
         use_llm=not offline,
         log_path=log_path,
+        edges=load_edges(track_dir, layout=layout),
     )
     source = csv_path
     if max_laps > 0:
@@ -127,17 +136,22 @@ def coach_replay(
         import tempfile
 
         rows = list(read_samples_csv(csv_path))
-        first = rows[0].lap
-        keep = [s for s in rows if s.lap <= first + max_laps]
-        tmp = Path(tempfile.mkstemp(suffix=".csv")[1])
-        from src.coach.samples import CSV_COLUMNS
-
-        with tmp.open("w", newline="", encoding="utf-8") as fh:
+        keep = [s for s in rows if s.lap <= rows[0].lap + max_laps]
+        source = Path(tempfile.mkstemp(suffix=".csv")[1])
+        with source.open("w", newline="", encoding="utf-8") as fh:
             writer = _csv.writer(fh)
             writer.writerow(CSV_COLUMNS)
             writer.writerows(s.row() for s in keep)
-        source = tmp
-    asyncio.run(replay(coach, source, realtime=realtime))
+
+    async def go() -> None:
+        if await prepare_notes(coach, settings.coach):
+            typer.echo("Claude wrote the initial notes:")
+            for name, note in coach.pace.notes.items():
+                typer.echo(f"  {name}: '{note.say}' | apex '{note.apex_say}'")
+        coach.state_path = None  # keep replays from rewriting the live notes
+        await replay(coach, source, realtime=realtime)
+
+    asyncio.run(go())
     coach.finish()
     typer.echo("\nSpoken:")
     for line in speaker.spoken:

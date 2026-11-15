@@ -11,15 +11,10 @@ from typing import Any
 
 import pytest
 from src.ai.anthropic_client import AnthropicClient, ClaudeRefusalError
-from src.coach.live import LiveCoach, heuristic_plan, say_lap_time
+from src.coach.coaches import CoachContext, CornerAdvisor, HeadCoach, pass_message
+from src.coach.live import LiveCoach, say_lap_time
 from src.coach.metrics import compare, comparison_table, measure_lap, reference_table
-from src.coach.planner import (
-    CoachPlan,
-    CoachPlanner,
-    CornerCall,
-    build_system_prompt,
-    plan_schema,
-)
+from src.coach.pacenotes import CornerNote, PaceNotes, PassRecord
 from src.coach.reference import (
     Reference,
     best_lap,
@@ -31,6 +26,7 @@ from src.coach.runner import (
     build_coach,
     debrief_message,
     make_reference,
+    prepare_notes,
     replay,
     session_laps,
 )
@@ -182,168 +178,6 @@ def test_say_lap_time_rounds_into_the_next_second() -> None:
     assert say_lap_time(138.0, 139.382) == "2 18 point 0, minus 1.4"
 
 
-def test_heuristic_plan_targets_the_worst_corner() -> None:
-    ref = measure_lap(reference().lap, CORNERS)
-    samples, duration = make_lap(1, t0=0.0, brake_a=110.0)
-    rows = compare(
-        measure_lap(LapTrace(samples, length_m=LENGTH, lap_time_s=duration), CORNERS), ref
-    )
-    plan = heuristic_plan(rows)
-    assert plan.calls[0].corner == "Alpha"
-    assert "brake" in plan.calls[0].say
-    assert heuristic_plan([]).calls == []
-    same = compare(ref, ref)
-    assert heuristic_plan(same).calls == []
-
-
-# -- planner --------------------------------------------------------------------
-class FakeLLM:
-    def __init__(self, reply: dict[str, Any]) -> None:
-        self.reply = reply
-        self.calls: list[tuple[str, str, dict[str, Any]]] = []
-
-    async def complete_json(self, system: str, user: str, schema: dict[str, Any]) -> dict[str, Any]:
-        self.calls.append((system, user, schema))
-        return self.reply
-
-
-def test_plan_schema_restricts_corners() -> None:
-    schema = plan_schema(["Alpha", "Bravo"], 2)
-    item = schema["properties"]["calls"]["items"]
-    assert item["properties"]["corner"]["enum"] == ["Alpha", "Bravo"]
-    assert "maxItems" not in schema["properties"]["calls"]  # unsupported by the API
-    many = {
-        "lap_comment": "",
-        "notes": "",
-        "calls": [{"corner": "Alpha", "say": f"call {i}", "why": ""} for i in range(4)],
-    }
-    assert len(CoachPlan.from_json(many, valid_corners={"Alpha"}, max_calls=2).calls) == 2
-
-
-def test_coach_plan_from_json_drops_unknown_corners() -> None:
-    plan = CoachPlan.from_json(
-        {
-            "lap_comment": " Good. ",
-            "calls": [
-                {"corner": "Alpha", "say": "Brake later", "why": "x"},
-                {"corner": "Nowhere", "say": "?", "why": ""},
-                {"corner": "Bravo", "say": "  ", "why": ""},
-            ],
-            "notes": "n",
-        },
-        valid_corners={"Alpha", "Bravo"},
-    )
-    assert plan.lap_comment == "Good."
-    assert [c.corner for c in plan.calls] == ["Alpha"]
-
-
-async def test_planner_sends_table_and_keeps_history(tmp_path: Path) -> None:
-    notes = tmp_path / "notes.md"
-    notes.write_text("Stay left before Alpha.", encoding="utf-8")
-    ref = reference()
-    ref_metrics = measure_lap(ref.lap, CORNERS)
-    system = build_system_prompt(
-        track_name="Test Ring",
-        car="car",
-        reference_time_s=ref.lap_time_s,
-        reference_metrics=ref_metrics,
-        context_files=[notes, tmp_path / "missing.md"],
-        max_calls=2,
-    )
-    assert "Stay left before Alpha." in system and "Alpha |" in system
-    llm = FakeLLM(
-        {
-            "lap_comment": "Brake later into Alpha.",
-            "calls": [{"corner": "Alpha", "say": "Alpha: brake later", "why": "early"}],
-            "notes": "",
-        }
-    )
-    planner = CoachPlanner(
-        llm, system_prompt=system, corner_names=["Alpha", "Bravo"], reference_time_s=ref.lap_time_s
-    )
-    rows = compare(ref_metrics, ref_metrics)
-    plan = await planner.plan(
-        lap_no=3, lap_time_s=ref.lap_time_s + 1, rows=rows, flags=["test flag"]
-    )
-    assert plan.calls[0].say == "Alpha: brake later"
-    _, user, _ = llm.calls[0]
-    assert "Lap 3" in user and "test flag" in user and "Alpha |" in user
-    await planner.plan(lap_no=4, lap_time_s=ref.lap_time_s, rows=rows)
-    assert "lap 3:" in llm.calls[1][1]
-    assert len(planner.history) == 2
-
-
-# -- live coach -------------------------------------------------------------------
-async def test_live_coach_speaks_lap_time_comment_and_calls(tmp_path: Path) -> None:
-    speaker = LogSpeaker()
-    log = tmp_path / "log.jsonl"
-
-    async def plan_fn(lap_no: int, lap_s: float, rows: Any, flags: list[str]) -> CoachPlan:
-        return CoachPlan(
-            lap_comment="Work on Bravo.",
-            calls=[CornerCall(corner="Bravo", say="Bravo: brake later")],
-        )
-
-    coach = LiveCoach(
-        corners=CORNERS,
-        reference=reference(),
-        speaker=speaker,
-        plan_fn=plan_fn,
-        call_lead_s=2.0,
-        log_path=log,
-    )
-    for sample in make_session(3):
-        lap_changed = coach._samples and sample.lap != coach._samples[-1].lap
-        await coach.feed(sample)
-        if lap_changed:
-            await coach.drain()
-    await coach.drain()
-    spoken = speaker.spoken
-    assert sum("point" in s for s in spoken) == 3  # three lap times
-    assert spoken.count("Bravo: brake later") == 2  # once on each following lap
-    assert "Work on Bravo." in spoken
-    events = [json.loads(line)["event"] for line in log.read_text().splitlines()]
-    assert {"lap", "plan", "call", "comment"} <= set(events)
-
-
-async def test_live_coach_falls_back_when_planner_fails() -> None:
-    speaker = LogSpeaker()
-
-    async def broken(*_: Any) -> CoachPlan:
-        raise RuntimeError("network down")
-
-    coach = LiveCoach(corners=CORNERS, reference=reference(), speaker=speaker, plan_fn=broken)
-    for sample in make_session(2, brake_a=100.0):
-        await coach.feed(sample)
-    await coach.drain()
-    assert coach.plans and coach.plans[-1].calls[0].corner == "Alpha"
-
-
-async def test_live_coach_skips_pit_laps() -> None:
-    speaker = LogSpeaker()
-    coach = LiveCoach(corners=CORNERS, reference=reference(), speaker=speaker)
-    samples, duration = make_lap(0, t0=0.0)
-    pit = [replace(s, in_pit=True) for s in samples]
-    for s in pit:
-        await coach.feed(s)
-    await coach.feed(
-        Sample(
-            t=duration,
-            lap=1,
-            pos=0.0,
-            speed_kmh=100,
-            gear=3,
-            gas=1,
-            brake=0,
-            last_ms=int(duration * 1000),
-        )
-    )
-    await coach.drain()
-    assert coach.plans == []
-    assert len(speaker.spoken) == 1  # just the lap time
-
-
-# -- Claude client ------------------------------------------------------------------
 class _FakeMessages:
     def __init__(self, response: Any) -> None:
         self.response = response
@@ -382,6 +216,7 @@ async def test_anthropic_client_json_request_shape() -> None:
     kw = messages.kwargs
     assert kw["model"] == "claude-opus-5-5"
     assert kw["fallbacks"] == "default" and kw["betas"] == ["server-side-fallback-2026-07-01"]
+    assert "thinking" not in kw
     assert kw["system"][0]["cache_control"] == {"type": "ephemeral"}
     assert kw["output_config"]["effort"] == "low"
     assert kw["output_config"]["format"]["type"] == "json_schema"
@@ -401,6 +236,27 @@ async def test_anthropic_client_text_and_refusal() -> None:
 
 
 # -- references, replay, debrief ----------------------------------------------------
+async def test_haiku_requests_skip_fallbacks_and_thinking() -> None:
+    fake, messages = _fake_client('{"ok": 1}')
+    client = AnthropicClient(model="claude-haiku-5-5", client=fake, thinking_off=True)
+    await client.complete_json("s", "u", {"type": "object"})
+    kw = messages.kwargs
+    assert "fallbacks" not in kw and "betas" not in kw
+    assert kw["thinking"] == {"type": "disabled"}
+    opus = AnthropicClient(model="claude-opus-5-5", client=fake, thinking_off=True)
+    assert opus.thinking_off is False
+
+
+async def test_client_tracks_usage() -> None:
+    fake, _ = _fake_client('{"x": 1}')
+    client = AnthropicClient(model="claude-opus-5-5", client=fake)
+    await client.complete_json("s", "u", {"type": "object"})
+    await client.complete_json("s", "u", {"type": "object"})
+    assert client.last is not None and client.last.calls == 1
+    assert client.total.calls == 2
+    assert client.total.cost_usd == pytest.approx(2 * (10 * 4 + 3 * 20 + 5 * 5) / 1e6)
+
+
 def _write_csv(path: Path, samples: list[Sample]) -> Path:
     with path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
@@ -429,52 +285,257 @@ def test_reference_roundtrip_and_make_reference(tmp_path: Path) -> None:
     assert load_reference(out).source == "test"
 
 
-async def test_replay_and_debrief_message(tmp_path: Path) -> None:
-    csv_path = _write_csv(tmp_path / "session.csv", make_session(3, brake_a=120.0))
-    speaker = LogSpeaker()
-    llm = FakeLLM(
-        {
-            "lap_comment": "Alpha next.",
-            "calls": [{"corner": "Alpha", "say": "Alpha: later", "why": ""}],
-            "notes": "",
-        }
+# -- fakes for the Claude roles ------------------------------------------------------
+class FakeJSON:
+    """Stands in for a Claude client: returns canned JSON per role."""
+
+    def __init__(self, reply: dict[str, Any] | Exception) -> None:
+        self.reply = reply
+        self.calls: list[tuple[str, str, dict[str, Any]]] = []
+        self.model = "fake"
+
+    async def complete_json(self, system: str, user: str, schema: dict[str, Any]) -> dict[str, Any]:
+        self.calls.append((system, user, schema))
+        if isinstance(self.reply, Exception):
+            raise self.reply
+        return self.reply
+
+
+ADVICE = {
+    "now": "Alpha: better.",
+    "say": "Alpha: brake at the mark",
+    "apex_say": "Kerb",
+    "call_turn": True,
+    "call_throttle": False,
+}
+PLAN = {
+    "lap_comment": "Good lap. Work on Alpha.",
+    "notes": "n",
+    "focus": [
+        {"corner": "Alpha", "objective": "Brake at the mark"},
+        {"corner": "Nowhere", "objective": "ignored"},
+    ],
+}
+
+
+def _context(tmp_path: Path | None = None) -> CoachContext:
+    ref = reference()
+    files = []
+    if tmp_path is not None:
+        brief = tmp_path / "brief.md"
+        brief.write_text("Alpha: use the kerb.", encoding="utf-8")
+        files = [brief, tmp_path / "missing.md"]
+    return CoachContext(
+        "Test Ring",
+        "car",
+        ref.lap_time_s,
+        measure_lap(ref.lap, CORNERS),
+        {"Alpha": 125.0},
+        {"Alpha": 76.0},
+        files,
     )
-    coach = build_coach(
-        CoachSettings(context_files=[]),
+
+
+def _coach(*, advisor: Any = None, head: Any = None, log: Path | None = None) -> LiveCoach:
+    ref = reference()
+    pace = PaceNotes(ref_metrics=measure_lap(ref.lap, CORNERS), ref_lap=ref.lap)
+    ctx = _context()
+    return LiveCoach(
+        corners=CORNERS,
+        reference=ref,
+        speaker=LogSpeaker(),
+        pace=pace,
+        advisor=CornerAdvisor(advisor, ctx) if advisor else None,
+        head=HeadCoach(head, ctx, ["Alpha", "Bravo"]) if head else None,
+        log_path=log,
+    )
+
+
+async def _drive(coach: LiveCoach, samples: list[Sample]) -> None:
+    for sample in samples:
+        await coach.feed(sample)
+        if coach.pending():
+            await coach.drain()
+    await coach.drain()
+
+
+def test_context_text_includes_files_and_targets(tmp_path: Path) -> None:
+    text = _context(tmp_path).text()
+    assert "Alpha: use the kerb." in text and "braking mark" in text and "Alpha |" in text
+
+
+async def test_live_coach_cues_verdicts_and_focus(tmp_path: Path) -> None:
+    log = tmp_path / "log.jsonl"
+    fast, head = FakeJSON(ADVICE), FakeJSON(PLAN)
+    coach = _coach(advisor=fast, head=head, log=log)
+    await _drive(coach, make_session(3, brake_a=120.0))
+    spoken = coach.speaker.spoken
+    assert "Brake" in spoken
+    assert any(s.startswith("Alpha") for s in spoken)  # approach note
+    assert "Alpha: better." in spoken  # verdict from the fast model
+    assert sum("point" in s for s in spoken) >= 2  # lap times
+    assert "Good lap. Work on Alpha." in spoken
+    assert coach.pace.notes["Alpha"].say == "Alpha: brake at the mark"
+    assert coach.pace.notes["Alpha"].objective == "Brake at the mark"
+    assert coach.pace.notes["Bravo"].objective == ""
+    assert "Kerb" in spoken and "Turn in" in spoken  # cues switched on by the advisor
+    assert "Corner: Alpha" in fast.calls[0][1] and "mark" in fast.calls[0][1]
+    assert "Lap 1" in head.calls[0][1]
+    events = {json.loads(line)["event"] for line in log.read_text().splitlines()}
+    assert {"cue", "pass", "advice", "lap", "plan", "said"} <= events
+
+
+async def test_live_coach_without_models_uses_quick_verdicts() -> None:
+    coach = _coach()
+    await _drive(coach, make_session(3, brake_a=100.0))
+    assert any("braked early" in s for s in coach.speaker.spoken)
+
+
+async def test_advisor_failure_falls_back_and_keeps_notes() -> None:
+    coach = _coach(advisor=FakeJSON(RuntimeError("down")), head=FakeJSON(RuntimeError("down")))
+    before = coach.pace.notes["Alpha"].say
+    await _drive(coach, make_session(2, brake_a=100.0))
+    assert coach.pace.notes["Alpha"].say == before
+    assert any("braked early" in s for s in coach.speaker.spoken)
+    assert coach.plans == []
+
+
+async def test_pit_laps_get_no_head_plan() -> None:
+    head = FakeJSON(PLAN)
+    coach = _coach(head=head)
+    samples, duration = make_lap(0, t0=0.0)
+    for s in samples:
+        await coach.feed(replace(s, in_pit=True))
+    await coach.feed(
+        Sample(
+            t=duration,
+            lap=1,
+            pos=0.0,
+            speed_kmh=100,
+            gear=3,
+            gas=1,
+            brake=0,
+            last_ms=int(duration * 1000),
+        )
+    )
+    await coach.drain()
+    assert head.calls == []
+
+
+async def test_initial_notes_writer_and_prepare(tmp_path: Path) -> None:
+    from src.coach.coaches import write_initial_notes
+
+    reply = {
+        "notes": [
+            {
+                "corner": "Alpha",
+                "say": "Alpha: left side",
+                "apex_say": "Kerb",
+                "call_turn": False,
+                "call_throttle": True,
+            },
+            {
+                "corner": "Nowhere",
+                "say": "x",
+                "apex_say": "",
+                "call_turn": False,
+                "call_throttle": False,
+            },
+        ]
+    }
+    coach = _coach()
+    notes = await write_initial_notes(FakeJSON(reply), _context(), coach.pace.notes)
+    assert notes["Alpha"].say == "Alpha: left side" and notes["Alpha"].call_throttle
+    assert "Nowhere" not in notes
+
+    settings = CoachSettings(context_files=[], notes_dir=str(tmp_path))
+    built = build_coach(
+        settings,
         track=TRACK,
         reference=reference(),
-        speaker=speaker,
+        speaker=LogSpeaker(),
         use_llm=True,
         log_path=None,
-        llm=llm,
+        head_llm=FakeJSON(reply),
+        fast_llm=FakeJSON(ADVICE),
+    )
+    assert await prepare_notes(built, settings) is True
+    assert built.pace.notes["Alpha"].apex_say == "Kerb"
+    again = build_coach(
+        settings,
+        track=TRACK,
+        reference=reference(),
+        speaker=LogSpeaker(),
+        use_llm=True,
+        log_path=None,
+        head_llm=FakeJSON(reply),
+        fast_llm=FakeJSON(ADVICE),
+    )
+    assert again.notes_from_claude and await prepare_notes(again, settings) is False
+    assert again.pace.notes["Alpha"].say == "Alpha: left side"
+
+
+def test_build_coach_uses_target_marks(tmp_path: Path) -> None:
+    stem = "test__-__car"
+    (tmp_path / f"{stem}__target.json").write_text(
+        json.dumps({"marks": {"Alpha": 140.0}, "corner_min_kmh": {"Alpha": 75.0}}), encoding="utf-8"
+    )
+    ref = reference()
+    ref = Reference("test", "-", "car", "synthetic", ref.lap)
+    settings = CoachSettings(context_files=[], notes_dir=str(tmp_path))
+    coach = build_coach(
+        settings, track=TRACK, reference=ref, speaker=LogSpeaker(), use_llm=False, log_path=None
+    )
+    assert coach.pace.marks["Alpha"] == 140.0
+    assert coach.target_min_kmh == {"Alpha": 75.0}
+    assert coach.advisor is None and coach.usage_summary() == "Claude calls: 0"
+    assert isinstance(make_speaker(enabled=False), LogSpeaker)
+
+
+async def test_replay_and_debrief_message(tmp_path: Path) -> None:
+    csv_path = _write_csv(tmp_path / "session.csv", make_session(3, brake_a=120.0))
+    settings = CoachSettings(context_files=[], notes_dir=str(tmp_path))
+    fast = FakeJSON(ADVICE)
+    coach = build_coach(
+        settings,
+        track=TRACK,
+        reference=reference(),
+        speaker=LogSpeaker(),
+        use_llm=True,
+        log_path=None,
+        head_llm=FakeJSON(PLAN),
+        fast_llm=fast,
     )
     await replay(coach, csv_path)
-    assert "Alpha: later" in speaker.spoken
-    assert len(llm.calls) == 3
+    assert "Alpha: better." in coach.speaker.spoken and len(fast.calls) >= 4
     laps = session_laps(csv_path, reference(), TRACK)
     assert len(laps) == 3
     text = debrief_message(laps, reference(), ["- after lap 1: Alpha next."])
     assert "Best lap" in text and "Alpha:" in text and "after lap 1" in text
+    coach.finish()
 
 
-def test_build_coach_offline_and_speaker_factory() -> None:
-    coach = build_coach(
-        CoachSettings(context_files=[]),
-        track=TRACK,
-        reference=reference(),
-        speaker=LogSpeaker(),
-        use_llm=False,
-        log_path=None,
+def test_pass_message_mentions_history_and_objective() -> None:
+    ref_metrics = measure_lap(reference().lap, CORNERS)
+    row = compare(ref_metrics, ref_metrics)[0]
+    note = CornerNote("Alpha", say="Alpha: left", objective="Brake later")
+    msg = pass_message(
+        row,
+        lap=4,
+        mark=125.0,
+        target_min=76.0,
+        history=[PassRecord(3, row, 125.0, "Same.")],
+        note=note,
     )
-    assert coach.plan_fn is None
-    assert isinstance(make_speaker(enabled=False), LogSpeaker)
+    assert "Lap 4" in msg and "mark @125" in msg and "Brake later" in msg and "Same." in msg
 
 
 def test_coach_settings_defaults() -> None:
     settings = CoachSettings()
     assert settings.model == "claude-opus-5-5"
+    assert settings.fast_model == "claude-haiku-5-5"
     assert settings.lap_effort == "low"
-    assert settings.max_calls_per_lap == 2
+    assert settings.pace_notes is True
 
 
 # -- usage and cost accounting ---------------------------------------------------------
@@ -492,45 +553,3 @@ def test_estimate_usage_prices_opus_tokens() -> None:
     assert estimate_usage("claude-opus-5-5", usage, fast=True).cost_usd == pytest.approx(58.4)
     assert estimate_usage("some-unknown-model", usage).cost_usd == 0.0
     assert estimate_usage("claude-opus-5-5", None).calls == 1
-
-
-async def test_client_tracks_usage_and_planner_attaches_it() -> None:
-    fake, _ = _fake_client('{"lap_comment": "ok", "calls": [], "notes": ""}')
-    client = AnthropicClient(model="claude-opus-5-5", client=fake)
-    planner = CoachPlanner(
-        client, system_prompt="s", corner_names=["Alpha"], reference_time_s=100.0
-    )
-    plan = await planner.plan(lap_no=1, lap_time_s=101.0, rows=[])
-    await planner.plan(lap_no=2, lap_time_s=100.5, rows=[])
-    assert plan.usage is not None and plan.usage["calls"] == 1
-    assert plan.usage["cache_write_tokens"] == 5
-    assert client.total.calls == 2
-    assert client.total.cost_usd == pytest.approx(2 * (10 * 4 + 3 * 20 + 5 * 5) / 1e6)
-
-
-async def test_live_coach_sums_usage(tmp_path: Path) -> None:
-    async def plan_fn(*_: Any) -> CoachPlan:
-        return CoachPlan(
-            lap_comment="",
-            usage={
-                "calls": 1,
-                "input_tokens": 100,
-                "cache_read_tokens": 4000,
-                "cache_write_tokens": 0,
-                "output_tokens": 300,
-                "cost_usd": 0.0078,
-            },
-        )
-
-    log = tmp_path / "log.jsonl"
-    coach = LiveCoach(
-        corners=CORNERS, reference=reference(), speaker=LogSpeaker(), plan_fn=plan_fn, log_path=log
-    )
-    assert coach.usage_summary() == "Claude calls: 0"
-    for sample in make_session(3):
-        await coach.feed(sample)
-    await coach.drain()
-    coach.finish()
-    assert coach.usage["calls"] == 3
-    assert "per lap" in coach.usage_summary() and "$0.0078 per lap" in coach.usage_summary()
-    assert '"event": "session-usage"' in log.read_text()

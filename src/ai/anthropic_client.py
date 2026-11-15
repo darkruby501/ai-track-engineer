@@ -19,6 +19,10 @@ import structlog
 _log = structlog.get_logger("ai.anthropic")
 
 _FALLBACK_BETA = "server-side-fallback-2026-07-01"
+# Models that accept server-side refusal fallbacks (Haiku 5.5 does not).
+_FALLBACK_MODELS = ("claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5", "claude-opus-5")
+# Models where thinking can be switched off (at effort high or below) for speed.
+_THINKING_OFF_MODELS = ("claude-haiku-5-5",)
 
 Effort = Literal["low", "medium", "high", "xhigh", "max"]
 
@@ -109,6 +113,7 @@ class AnthropicClient:
         speed: str = "standard",
         timeout_s: float = 45.0,
         client: Any | None = None,
+        thinking_off: bool = False,
     ) -> None:
         if client is None:  # pragma: no cover - real network client
             import anthropic
@@ -118,6 +123,7 @@ class AnthropicClient:
         self.model = model
         self.effort: Effort = effort
         self.speed = speed
+        self.thinking_off = thinking_off and model.startswith(_THINKING_OFF_MODELS)
         self.total = Usage()
         self.last: Usage | None = None
 
@@ -136,12 +142,15 @@ class AnthropicClient:
         kwargs: dict[str, Any] = {
             "model": self.model,
             "max_tokens": max_tokens,
-            "betas": [_FALLBACK_BETA],
-            "fallbacks": "default",
             "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
             "messages": [{"role": "user", "content": user}],
             "output_config": output_config,
         }
+        if self.model.startswith(_FALLBACK_MODELS):
+            kwargs["betas"] = [_FALLBACK_BETA]
+            kwargs["fallbacks"] = "default"
+        if self.thinking_off:
+            kwargs["thinking"] = {"type": "disabled"}
         if self.speed == "fast":
             kwargs["speed"] = "fast"
         response = await self._client.beta.messages.create(**kwargs)

@@ -12,9 +12,10 @@ from typing import Any
 import structlog
 
 from src.ai.anthropic_client import AnthropicClient, Effort
+from src.coach.coaches import CoachContext, CornerAdvisor, HeadCoach, write_initial_notes
 from src.coach.live import LiveCoach
 from src.coach.metrics import CornerComparison, compare, comparison_table, measure_lap
-from src.coach.planner import CoachPlan, CoachPlanner, build_system_prompt
+from src.coach.pacenotes import PaceNotes
 from src.coach.reference import (
     Reference,
     best_lap,
@@ -26,41 +27,9 @@ from src.coach.samples import CSV_COLUMNS, LapTrace, Sample, read_samples_csv, s
 from src.coach.speaker import LogSpeaker, make_speaker
 from src.config.settings import CoachSettings
 from src.knowledge.models import TrackInfo
+from src.knowledge.track_edges import TrackEdges
 
 _log = structlog.get_logger("coach.runner")
-
-
-def make_planner(
-    settings: CoachSettings,
-    *,
-    track: TrackInfo,
-    reference: Reference,
-    llm: Any | None = None,
-) -> CoachPlanner:
-    from src.coach.metrics import measure_lap as _measure
-
-    ref_metrics = _measure(reference.lap, track.corners)
-    system = build_system_prompt(
-        track_name=track.name,
-        car=reference.car,
-        reference_time_s=reference.lap_time_s,
-        reference_metrics=ref_metrics,
-        context_files=[Path(p) for p in settings.context_files],
-        max_calls=settings.max_calls_per_lap,
-    )
-    client = llm or AnthropicClient(
-        model=settings.model,
-        effort=_effort(settings.lap_effort),
-        speed=settings.speed,
-        timeout_s=settings.request_timeout_s,
-    )
-    return CoachPlanner(
-        client,
-        system_prompt=system,
-        corner_names=[c.name for c in track.corners],
-        reference_time_s=reference.lap_time_s,
-        max_calls=settings.max_calls_per_lap,
-    )
 
 
 def _effort(value: str) -> Effort:
@@ -71,6 +40,15 @@ def _effort(value: str) -> Effort:
     raise ValueError(f"unknown effort {value!r}")
 
 
+def state_stem(track: str, layout: str, car: str) -> str:
+    return f"{track}__{layout}__{car}"
+
+
+def load_target(settings: CoachSettings, stem: str) -> dict[str, Any]:
+    path = Path(settings.notes_dir) / f"{stem}__target.json"
+    return dict(json.loads(path.read_text(encoding="utf-8"))) if path.is_file() else {}
+
+
 def build_coach(
     settings: CoachSettings,
     *,
@@ -79,25 +57,96 @@ def build_coach(
     speaker: LogSpeaker,
     use_llm: bool,
     log_path: Path | None,
-    llm: Any | None = None,
+    edges: TrackEdges | None = None,
+    head_llm: Any | None = None,
+    fast_llm: Any | None = None,
 ) -> LiveCoach:
-    planner = make_planner(settings, track=track, reference=reference, llm=llm) if use_llm else None
-
-    async def plan_fn(
-        lap_no: int, lap_s: float, rows: list[CornerComparison], flags: list[str]
-    ) -> CoachPlan:
-        assert planner is not None
-        return await planner.plan(lap_no=lap_no, lap_time_s=lap_s, rows=rows, flags=flags)
-
-    return LiveCoach(
+    """Assemble the live coach: pace notes, marks, Claude roles and speaker."""
+    stem = state_stem(reference.track, reference.layout, reference.car)
+    target = load_target(settings, stem)
+    marks = {k: float(v) for k, v in target.get("marks", {}).items()}
+    target_min = {k: float(v) for k, v in target.get("corner_min_kmh", {}).items()}
+    ref_metrics = measure_lap(reference.lap, track.corners, edges=edges)
+    pace = PaceNotes(
+        ref_metrics=ref_metrics,
+        ref_lap=reference.lap,
+        marks=dict(marks),
+        seed_marks=dict(marks),
+        lead_s=settings.pace_lead_s,
+        latency_s=settings.cue_latency_s,
+    )
+    state_path = Path(settings.notes_dir) / f"{stem}__notes.json"
+    state = PaceNotes.load_state(state_path)
+    state.pop("marks", None)  # marks always come from the current target
+    state.pop("seed_marks", None)
+    pace.apply_state(state)
+    advisor = head = None
+    clients: list[Any] = []
+    context: CoachContext | None = None
+    head_client: Any = None
+    if use_llm:
+        context = CoachContext(
+            track_name=track.name,
+            car=reference.car,
+            reference_time_s=reference.lap_time_s,
+            reference_metrics=ref_metrics,
+            marks=pace.marks,
+            target_min_kmh=target_min,
+            context_files=[Path(p) for p in settings.context_files],
+        )
+        head_client = head_llm or AnthropicClient(
+            model=settings.model,
+            effort=_effort(settings.lap_effort),
+            speed=settings.speed,
+            timeout_s=settings.request_timeout_s,
+        )
+        fast_client = fast_llm or AnthropicClient(
+            model=settings.fast_model, effort="low", timeout_s=15.0, thinking_off=True
+        )
+        head = HeadCoach(head_client, context, [m.name for m in ref_metrics])
+        advisor = CornerAdvisor(fast_client, context)
+        clients = [head_client, fast_client]
+    coach = LiveCoach(
         corners=track.corners,
         reference=reference,
         speaker=speaker,
-        plan_fn=plan_fn if planner is not None else None,
-        call_lead_s=settings.call_lead_s,
+        pace=pace,
+        edges=edges,
+        advisor=advisor,
+        head=head,
+        target_min_kmh=target_min,
         log_path=log_path,
-        plan_timeout_s=settings.request_timeout_s,
+        state_path=state_path,
+        head_timeout_s=settings.request_timeout_s,
+        clients=clients,
+        context=context,
+        head_client=head_client,
+        notes_from_claude=state.get("notes_source") == "claude",
     )
+    return coach
+
+
+async def prepare_notes(coach: LiveCoach, settings: CoachSettings) -> bool:
+    """Have the head model write initial notes once (they are saved and reused)."""
+    if coach.head_client is None or coach.context is None or coach.notes_from_claude:
+        return False
+    try:
+        notes = await asyncio.wait_for(
+            write_initial_notes(coach.head_client, coach.context, coach.pace.notes),
+            settings.request_timeout_s * 2,
+        )
+    except Exception as exc:  # noqa: BLE001 - template notes still work
+        _log.warning("initial-notes-failed", error=repr(exc))
+        return False
+    coach.pace.notes.update(notes)
+    coach._cues_dirty = True
+    if coach.state_path is not None:
+        coach.pace.save(coach.state_path)
+        data = json.loads(coach.state_path.read_text(encoding="utf-8"))
+        data["notes_source"] = "claude"
+        coach.state_path.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    coach.notes_from_claude = True
+    return True
 
 
 # -- reference packs ---------------------------------------------------------
@@ -128,9 +177,8 @@ async def replay(coach: LiveCoach, csv_path: Path, *, realtime: float = 0.0) -> 
     for sample in read_samples_csv(csv_path):
         if realtime > 0 and previous is not None:
             await asyncio.sleep(max(0.0, (sample.t - previous.t) / realtime))
-        lap_changed = previous is not None and sample.lap != previous.lap
         await coach.feed(sample)
-        if lap_changed and realtime <= 0:
+        if realtime <= 0 and coach.pending():
             await coach.drain()
         previous = sample
     await coach.drain()
@@ -164,6 +212,7 @@ async def run_live(
 
     from src.config import find_ac_install, get_settings
     from src.knowledge import load_track
+    from src.knowledge.track_edges import load_edges
     from src.telemetry import SharedMemoryTelemetrySource
     from src.telemetry.shm_reader import SharedMemoryUnavailableError
     from src.telemetry.shm_structs import ACStatus
@@ -215,6 +264,7 @@ async def run_live(
                 / f"coach_{static.track}_{layout}_{static.car_model}_{stamp}"
             )
             writer = _CsvWriter(base.with_suffix(".csv"))
+            edges = load_edges(track_dir, layout=layout) if track_dir else None
             coach = build_coach(
                 settings,
                 track=track,
@@ -222,7 +272,9 @@ async def run_live(
                 speaker=speaker,
                 use_llm=use_llm,
                 log_path=base.with_suffix(".jsonl"),
+                edges=edges,
             )
+            notes_task = asyncio.get_running_loop().create_task(prepare_notes(coach, settings))
             _log.info("coaching", track=track.name, car=static.car_model, csv=str(writer.path))
             speaker.say("Coach ready.")
             last_packet = -1
@@ -244,6 +296,7 @@ async def run_live(
             finally:
                 writer.close()
                 source.close()
+                notes_task.cancel()
                 await coach.drain()
                 coach.finish()
                 _log.info("session-ended", csv=str(writer.path), usage=coach.usage_summary())

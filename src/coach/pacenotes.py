@@ -169,23 +169,31 @@ class PaceNotes:
                 self.marks[name] = float(value)
 
 
+def spoken_name(name: str) -> str:
+    """Corner name as it should be read aloud ("Cotton Corners (right)" -> "Cotton right")."""
+    if "(" in name and name.endswith(")"):
+        base, extra = name[:-1].split("(", 1)
+        return f"{base.split()[0]} {extra.strip()}"
+    return name
+
+
 def quick_verdict(row: CornerComparison, previous: PassRecord | None, mark: float | None) -> str:
-    """An instant few-word verdict on a pass (used if the fast model is slow)."""
+    """An instant few-word verdict on a pass, or "" if there is nothing worth saying."""
     parts: list[str] = []
     if previous is not None:
         delta = row.driver.section_s - previous.row.driver.section_s
         if delta <= -0.05:
-            parts.append(f"Better, {abs(delta):.1f} up")
+            parts.append(f"better, {abs(delta):.1f} up")
         elif delta >= 0.05:
-            parts.append(f"Slower, {delta:.1f} down")
-        else:
-            parts.append("Same as last time")
+            parts.append(f"slower, {delta:.1f} down")
     if mark is not None and row.driver.brake_m is not None:
         miss = row.driver.brake_m - mark
         if miss < -10:
             parts.append("braked early")
         elif miss > 10:
             parts.append("braked past the mark")
-        else:
+        elif parts:
             parts.append("on the mark")
-    return ", ".join(parts) + "." if parts else ""
+    if not parts:
+        return ""
+    return f"{spoken_name(row.name)}: " + ", ".join(parts) + "."

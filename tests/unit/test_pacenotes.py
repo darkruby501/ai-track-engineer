@@ -174,9 +174,13 @@ def test_quick_verdict() -> None:
     )[0]
     best = compare(ref_metrics, ref_metrics)[0]
     mark = 150.0
-    assert quick_verdict(slow, None, mark) == "braked early."
+    assert quick_verdict(slow, None, mark) == "Alpha: braked early."
     previous = PassRecord(lap=1, row=slow, mark_m=mark)
     verdict = quick_verdict(best, previous, mark)
-    assert verdict.startswith("Better") and "on the mark" in verdict
-    assert quick_verdict(best, PassRecord(1, best, None), None) == "Same as last time."
+    assert verdict.startswith("Alpha: better") and "on the mark" in verdict
+    assert quick_verdict(best, PassRecord(1, best, None), None) == ""
+    from src.coach.pacenotes import spoken_name
+
+    assert spoken_name("Cotton Corners (right)") == "Cotton right"
+    assert spoken_name("Phil Hill") == "Phil Hill"
     assert template_note(ref_metrics[0]).call_brake
