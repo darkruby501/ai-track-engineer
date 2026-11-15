@@ -106,3 +106,41 @@ def test_load_track_missing_files_falls_back(tmp_path: Path) -> None:
     assert track.name == "barebones"
     assert track.corner_count == 0
     assert track.length_m == 0.0
+
+
+def test_load_track_uses_override_sections_when_track_has_none(tmp_path: Path) -> None:
+    track_dir = tmp_path / "tracks" / "mod_track"
+    (track_dir / "layout_a" / "data").mkdir(parents=True)
+    overrides = tmp_path / "overrides"
+    (overrides / "mod_track" / "layout_a").mkdir(parents=True)
+    (overrides / "mod_track" / "layout_a" / "sections.ini").write_text(
+        _SECTIONS_INI, encoding="utf-8"
+    )
+    track = load_track(track_dir, layout="layout_a", overrides_dir=overrides)
+    assert [c.name for c in track.corners] == ["Turn 1", "Andretti Hairpin", "The Corkscrew"]
+
+
+def test_track_sections_take_priority_over_override(tmp_path: Path) -> None:
+    track_dir = _make_track_dir(tmp_path / "ks_laguna_seca")
+    overrides = tmp_path / "overrides"
+    (overrides / "ks_laguna_seca").mkdir(parents=True)
+    (overrides / "ks_laguna_seca" / "sections.ini").write_text(
+        "[SECTION_0]\nIN=0.1\nOUT=0.2\nTEXT=Override\n", encoding="utf-8"
+    )
+    track = load_track(track_dir, overrides_dir=overrides)
+    assert track.corner_count == 3
+
+
+def test_bundled_buttonwillow_13cw_sections_are_ordered_and_disjoint() -> None:
+    from src.knowledge.track_parser import BUNDLED_TRACK_OVERRIDES
+
+    path = BUNDLED_TRACK_OVERRIDES / "nd_buttonwillow" / "layout_classic_13" / "sections.ini"
+    corners = parse_sections(path.read_text(encoding="utf-8"))
+    names = [c.name for c in corners]
+    assert names[0] == "Sunrise"
+    assert names[1] == "Off Ramp"
+    assert names[-1] == "Sunset"
+    assert "Phil Hill" in names
+    assert len(corners) == 14
+    for corner, nxt in zip(corners, corners[1:], strict=False):
+        assert 0.0 <= corner.entry < corner.exit <= nxt.entry < 1.0

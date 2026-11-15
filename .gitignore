@@ -89,3 +89,6 @@ Thumbs.db
 .docker-data/
 influxdb-data/
 ollama-data/
+
+# ---- Local-only data (third-party track files, personal laps) ----
+data/local/

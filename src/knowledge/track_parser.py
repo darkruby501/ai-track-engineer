@@ -102,8 +102,17 @@ def _resolve_layout_dir(track_dir: Path, layout: str) -> Path:
     return candidate if layout and candidate.is_dir() else track_dir
 
 
+# Corner definitions shipped with this project for tracks whose files lack a
+# ``sections.ini`` (laid out as ``<track_id>/<layout>/sections.ini``).
+BUNDLED_TRACK_OVERRIDES = Path(__file__).parent / "track_overrides"
+
+
 def load_track(
-    track_dir: str | Path, *, track_id: str | None = None, layout: str = ""
+    track_dir: str | Path,
+    *,
+    track_id: str | None = None,
+    layout: str = "",
+    overrides_dir: Path | None = None,
 ) -> TrackInfo:
     """Load a :class:`TrackInfo` from a track directory.
 
@@ -111,12 +120,17 @@ def load_track(
         track_dir: Path to ``content/tracks/<track_id>``.
         track_id: Track identifier; defaults to the directory name.
         layout: Optional layout name for multi-layout tracks.
+        overrides_dir: Where to look for a project-supplied ``sections.ini``
+            when the track has none; defaults to :data:`BUNDLED_TRACK_OVERRIDES`.
     """
     track_path = Path(track_dir)
     resolved_track_id = track_id or track_path.name
     base = _resolve_layout_dir(track_path, layout)
 
     sections_path = base / "data" / "sections.ini"
+    if not sections_path.is_file():
+        override_root = overrides_dir if overrides_dir is not None else BUNDLED_TRACK_OVERRIDES
+        sections_path = override_root / resolved_track_id / layout / "sections.ini"
     corners: tuple[Corner, ...] = ()
     if sections_path.is_file():
         corners = parse_sections(sections_path.read_text(encoding="utf-8", errors="ignore"))
