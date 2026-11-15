@@ -160,13 +160,13 @@ async def run_live(
     settings: CoachSettings, *, use_llm: bool, poll_hz: int = 60
 ) -> None:  # pragma: no cover - needs AC
     """Coach every AC session until interrupted (reconnects between sessions)."""
+    import os
+
     from src.config import find_ac_install, get_settings
     from src.knowledge import load_track
     from src.telemetry import SharedMemoryTelemetrySource
     from src.telemetry.shm_reader import SharedMemoryUnavailableError
     from src.telemetry.shm_structs import ACStatus
-
-    import os
 
     speaker = make_speaker(enabled=settings.voice, rate=settings.voice_rate)
     if use_llm and not (
