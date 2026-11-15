@@ -75,6 +75,8 @@ def make_lap(
     s, t = 0.0, t0
     while s < LENGTH:
         v, gas, brake = _speed_profile(s, brake_a, brake_b, min_a)
+        # Steering: Alpha is a right-hander, Bravo a left-hander (turn-in after braking).
+        steer = 0.2 if 200 <= s < 310 else (-0.2 if 600 <= s < 710 else 0.0)
         samples.append(
             Sample(
                 t=t,
@@ -84,6 +86,7 @@ def make_lap(
                 gear=4,
                 gas=gas,
                 brake=brake,
+                steer=steer,
                 current_ms=int((t - t0) * 1000),
                 last_ms=last_ms,
             )

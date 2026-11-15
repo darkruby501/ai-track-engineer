@@ -70,6 +70,12 @@ class CoachSettings(BaseModel):
     # Seconds of warning before the reference braking point for a corner call.
     call_lead_s: float = 4.5
     max_calls_per_lap: int = 2
+    # Pace notes: per-corner notes, braking marks and the conservative target.
+    notes_dir: str = "data/local/pacenotes"
+    pace_notes: bool = True
+    pace_lead_s: float = 3.5  # approach sentence starts this long before the mark
+    cue_latency_s: float = 0.35  # say cue words this early to absorb TTS delay
+    fast_model: str = "claude-haiku-5-5"  # per-corner verdicts and note updates
 
 
 class AppSettings(BaseModel):

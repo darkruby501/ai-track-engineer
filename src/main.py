@@ -146,6 +146,75 @@ def coach_replay(
     typer.echo(f"log: {log_path}")
 
 
+@coach_app.command("target-line")
+def coach_target_line(
+    track: str = typer.Option("nd_buttonwillow"),
+    layout: str = typer.Option("layout_classic_13"),
+    car: str = typer.Option("ks_mazda_miata"),
+    track_dir: Annotated[
+        Path | None, typer.Option(help="Track folder (default: AC install).")
+    ] = None,
+    base_margin_m: float = typer.Option(0.3, help="Wheel margin inside the edges, metres."),
+    lat_g: float = typer.Option(0.9, help="Cornering grip used for target speeds."),
+    brake_g: float = typer.Option(0.95, help="Braking used for target braking points."),
+) -> None:
+    """Build the conservative target line, marks and an AC ideal-line file."""
+    import json
+
+    import numpy as np
+
+    from src.coach.metrics import corner_spans
+    from src.coach.reference import load_reference, reference_path
+    from src.coach.target_line import (
+        DEFAULT_RISK_ZONES,
+        CarModel,
+        build_conservative_target,
+        read_ai_spline,
+        to_ideal_line,
+        write_ai_spline,
+    )
+
+    settings = get_settings()
+    reference = load_reference(reference_path(settings.coach.reference_dir, track, layout, car))
+    if track_dir is None:
+        ac_path = find_ac_install(settings.app.ac_install_path)
+        track_dir = Path(ac_path) / "content" / "tracks" / track if ac_path else Path(track)
+    base = track_dir / layout if (track_dir / layout).is_dir() else track_dir
+    spline = read_ai_spline(base / "ai" / "fast_lane.ai")
+    right = np.loadtxt(base / "data" / "side_r.csv", delimiter=",", usecols=(0, 1, 2), ndmin=2)
+    info = load_track(track_dir, track_id=track, layout=layout)
+    spans = corner_spans(info.corners, reference.lap.length_m)
+    target = build_conservative_target(
+        spline,
+        np.c_[right[:, 0], -right[:, 2]],
+        ref_s=reference.lap.s,
+        ref_speed_kmh=reference.lap.speed,
+        corner_spans=spans,
+        car=CarModel(lat_g=lat_g, brake_g=brake_g),
+        base_margin_m=base_margin_m,
+        risk_zones=DEFAULT_RISK_ZONES.get((track, layout), []),
+    )
+    marks = target.brake_points(spans)
+    out_dir = Path(settings.coach.notes_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"{track}__{layout}__{car}"
+    payload = {
+        "lap_time_model_s": round(target.lap_time_s, 2),
+        "marks": {k: round(v, 1) for k, v in marks.items()},
+        "corner_min_kmh": {
+            name: round(
+                float(target.v[(target.s_spline >= a) & (target.s_spline <= b)].min()) * 3.6, 1
+            )
+            for name, a, b in spans
+        },
+        "settings": {"base_margin_m": base_margin_m, "lat_g": lat_g, "brake_g": brake_g},
+    }
+    (out_dir / f"{stem}__target.json").write_text(json.dumps(payload, indent=1), encoding="utf-8")
+    write_ai_spline(to_ideal_line(spline, target), out_dir / f"{stem}__ideal_line.ai")
+    typer.echo(json.dumps(payload, indent=1))
+    typer.echo(f"wrote {out_dir / (stem + '__target.json')} and {stem}__ideal_line.ai")
+
+
 @coach_app.command("debrief")
 def coach_debrief(
     csv_path: Annotated[Path, typer.Argument(help="Session CSV written by `coach run`.")],

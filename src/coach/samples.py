@@ -159,6 +159,7 @@ class LapTrace:
         self.gas: NDArray[np.float64] = np.array([s.gas for s in keep])
         self.brake: NDArray[np.float64] = np.array([s.brake for s in keep])
         self.gear: NDArray[np.int64] = np.array([s.gear for s in keep], dtype=np.int64)
+        self.steer: NDArray[np.float64] = np.array([s.steer for s in keep])
         self.x: NDArray[np.float64] = np.array([s.x for s in keep])
         self.z: NDArray[np.float64] = np.array([s.z for s in keep])
         # Elapsed time must rise with distance for interpolation; enforce it.
@@ -180,6 +181,7 @@ class LapTrace:
             "gas": [round(float(v), 3) for v in self.gas],
             "brake": [round(float(v), 3) for v in self.brake],
             "gear": [int(v) for v in self.gear],
+            "steer": [round(float(v), 4) for v in self.steer],
             "x": [round(float(v), 2) for v in self.x],
             "z": [round(float(v), 2) for v in self.z],
         }
@@ -195,6 +197,7 @@ class LapTrace:
         obj.gas = np.array(data["gas"], dtype=float)
         obj.brake = np.array(data["brake"], dtype=float)
         obj.gear = np.array(data["gear"], dtype=np.int64)
+        obj.steer = np.array(data.get("steer", [0.0] * len(obj.s)), dtype=float)
         obj.x = np.array(data.get("x", []), dtype=float)
         obj.z = np.array(data.get("z", []), dtype=float)
         return obj
