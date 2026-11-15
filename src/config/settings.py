@@ -60,9 +60,8 @@ class CoachSettings(BaseModel):
     # Markdown files folded into the coach's (cached) system prompt.
     context_files: list[str] = Field(
         default_factory=lambda: [
-            "docs/tracks/buttonwillow-13cw-guide.md",
-            "data/local/driver-notes-bw13.md",
-            "data/local/driver-real-lap-bw13.md",
+            "docs/tracks/buttonwillow-13cw-coach-brief.md",
+            "data/local/driver-brief-bw13.md",
         ]
     )
     sessions_dir: str = "data/sessions"
