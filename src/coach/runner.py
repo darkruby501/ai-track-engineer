@@ -245,7 +245,8 @@ async def run_live(
                 writer.close()
                 source.close()
                 await coach.drain()
-                _log.info("session-ended", csv=str(writer.path))
+                coach.finish()
+                _log.info("session-ended", csv=str(writer.path), usage=coach.usage_summary())
     finally:
         speaker.close()
 

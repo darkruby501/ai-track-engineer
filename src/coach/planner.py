@@ -68,6 +68,7 @@ class CoachPlan:
     lap_comment: str
     calls: list[CornerCall] = field(default_factory=list)
     notes: str = ""
+    usage: dict[str, Any] | None = None  # tokens and estimated cost of the call
 
     @classmethod
     def from_json(cls, data: dict[str, Any], *, valid_corners: set[str]) -> CoachPlan:
@@ -217,6 +218,8 @@ class CoachPlanner:
         )
         data = await self._llm.complete_json(self._system, message, self._schema)
         plan = CoachPlan.from_json(data, valid_corners=set(self._corners))
+        last = getattr(self._llm, "last", None)
+        plan.usage = last.as_dict() if last is not None else None
         worst = sorted(((r.name, r.time_lost_s) for r in rows), key=lambda x: -x[1])[:3]
         self.history.append(LapRecord(lap_no, lap_time_s, worst, plan))
         return plan

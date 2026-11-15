@@ -466,3 +466,62 @@ def test_coach_settings_defaults() -> None:
     assert settings.model == "claude-opus-5-5"
     assert settings.lap_effort == "low"
     assert settings.max_calls_per_lap == 2
+
+
+# -- usage and cost accounting ---------------------------------------------------------
+def test_estimate_usage_prices_opus_tokens() -> None:
+    from src.ai.anthropic_client import estimate_usage
+
+    usage = SimpleNamespace(
+        input_tokens=1_000_000,
+        cache_read_input_tokens=1_000_000,
+        cache_creation_input_tokens=1_000_000,
+        output_tokens=1_000_000,
+    )
+    est = estimate_usage("claude-opus-5-5", usage)
+    assert est.cost_usd == pytest.approx(4.0 + 0.20 + 5.0 + 20.0)
+    assert estimate_usage("claude-opus-5-5", usage, fast=True).cost_usd == pytest.approx(58.4)
+    assert estimate_usage("some-unknown-model", usage).cost_usd == 0.0
+    assert estimate_usage("claude-opus-5-5", None).calls == 1
+
+
+async def test_client_tracks_usage_and_planner_attaches_it() -> None:
+    fake, _ = _fake_client('{"lap_comment": "ok", "calls": [], "notes": ""}')
+    client = AnthropicClient(model="claude-opus-5-5", client=fake)
+    planner = CoachPlanner(
+        client, system_prompt="s", corner_names=["Alpha"], reference_time_s=100.0
+    )
+    plan = await planner.plan(lap_no=1, lap_time_s=101.0, rows=[])
+    await planner.plan(lap_no=2, lap_time_s=100.5, rows=[])
+    assert plan.usage is not None and plan.usage["calls"] == 1
+    assert plan.usage["cache_write_tokens"] == 5
+    assert client.total.calls == 2
+    assert client.total.cost_usd == pytest.approx(2 * (10 * 4 + 3 * 20 + 5 * 5) / 1e6)
+
+
+async def test_live_coach_sums_usage(tmp_path: Path) -> None:
+    async def plan_fn(*_: Any) -> CoachPlan:
+        return CoachPlan(
+            lap_comment="",
+            usage={
+                "calls": 1,
+                "input_tokens": 100,
+                "cache_read_tokens": 4000,
+                "cache_write_tokens": 0,
+                "output_tokens": 300,
+                "cost_usd": 0.0078,
+            },
+        )
+
+    log = tmp_path / "log.jsonl"
+    coach = LiveCoach(
+        corners=CORNERS, reference=reference(), speaker=LogSpeaker(), plan_fn=plan_fn, log_path=log
+    )
+    assert coach.usage_summary() == "Claude calls: 0"
+    for sample in make_session(3):
+        await coach.feed(sample)
+    await coach.drain()
+    coach.finish()
+    assert coach.usage["calls"] == 3
+    assert "per lap" in coach.usage_summary() and "$0.0078 per lap" in coach.usage_summary()
+    assert '"event": "session-usage"' in log.read_text()

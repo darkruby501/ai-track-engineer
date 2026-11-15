@@ -138,10 +138,12 @@ def coach_replay(
             writer.writerows(s.row() for s in keep)
         source = tmp
     asyncio.run(replay(coach, source, realtime=realtime))
+    coach.finish()
     typer.echo("\nSpoken:")
     for line in speaker.spoken:
         typer.echo(f"  > {line}")
-    typer.echo(f"\nlog: {log_path}")
+    typer.echo(f"\n{coach.usage_summary()}")
+    typer.echo(f"log: {log_path}")
 
 
 @coach_app.command("debrief")

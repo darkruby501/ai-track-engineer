@@ -86,6 +86,7 @@ class LiveCoach:
     _tasks: set[asyncio.Task[None]] = field(default_factory=set)
     _laps_seen: int = 0
     plans: list[CoachPlan] = field(default_factory=list)
+    usage: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._ref_metrics = measure_lap(self.reference.lap, self.corners)
@@ -216,6 +217,8 @@ class LiveCoach:
                 _log.warning("planner-failed", error=repr(exc))
                 plan = heuristic_plan(rows)
         self.plans.append(plan)
+        for key, value in (plan.usage or {}).items():
+            self.usage[key] = self.usage.get(key, 0) + value
         self._active = {c.corner: c for c in plan.calls}
         self._pending_comment = plan.lap_comment or None
         self._event(
@@ -225,7 +228,28 @@ class LiveCoach:
             comment=plan.lap_comment,
             calls=[{"corner": c.corner, "say": c.say, "why": c.why} for c in plan.calls],
             notes=plan.notes,
+            usage=plan.usage,
         )
+
+    def usage_summary(self) -> str:
+        """One line: Claude calls, tokens and estimated cost so far."""
+        u = self.usage
+        calls = int(u.get("calls", 0))
+        if not calls:
+            return "Claude calls: 0"
+        cost = u.get("cost_usd", 0.0)
+        return (
+            f"Claude calls: {calls} | input {int(u.get('input_tokens', 0))} + cache read "
+            f"{int(u.get('cache_read_tokens', 0))} + cache write "
+            f"{int(u.get('cache_write_tokens', 0))} | output (incl. thinking) "
+            f"{int(u.get('output_tokens', 0))} | est. ${cost:.4f} total, "
+            f"${cost / calls:.4f} per lap"
+        )
+
+    def finish(self) -> None:
+        """Log the session's Claude usage (call at the end of a session)."""
+        if self.usage:
+            self._event("session-usage", **{k: round(v, 5) for k, v in self.usage.items()})
 
     def _event(self, kind: str, **data: Any) -> None:
         _log.info(kind, **data)
