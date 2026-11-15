@@ -553,3 +553,27 @@ def test_estimate_usage_prices_opus_tokens() -> None:
     assert estimate_usage("claude-opus-5-5", usage, fast=True).cost_usd == pytest.approx(58.4)
     assert estimate_usage("some-unknown-model", usage).cost_usd == 0.0
     assert estimate_usage("claude-opus-5-5", None).calls == 1
+
+
+def test_speakable_rejects_distances_and_numbers() -> None:
+    from src.coach.coaches import speakable
+
+    assert speakable("Phil Hill: better, braked on the mark.")
+    assert speakable("Sunrise: a tenth quicker, 0.1 up.")
+    for bad in ["braked 29 metres late", "mark is 3124", "0.03 faster", "brake 30 m earlier"]:
+        assert not speakable(bad), bad
+
+
+async def test_advisor_filters_unspeakable_text() -> None:
+    reply = {
+        "now": "Alpha: braked 29 metres late",
+        "say": "Brake at 3124",
+        "apex_say": "Kerb",
+        "call_turn": False,
+        "call_throttle": False,
+    }
+    advisor = CornerAdvisor(FakeJSON(reply), _context())
+    note = CornerNote("Alpha", say="Alpha: stay left")
+    advice = await advisor.advise("msg", note)
+    assert advice.now == "" and advice.rejected
+    assert advice.note.say == "Alpha: stay left" and advice.note.apex_say == "Kerb"

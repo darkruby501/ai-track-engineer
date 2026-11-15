@@ -15,6 +15,7 @@ target numbers) which is sent as the cached system prompt.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
@@ -81,10 +82,11 @@ Return:
 seconds later, so start with the corner's short spoken name). How this pass \
 went compared with their previous pass, and the one thing that made the \
 difference. E.g. "Phil Hill: better, braked on the mark." / "Sunrise: two \
-tenths slower, turned in early." No numbers except tenths of a second. \
-Return "" when nothing changed that is worth the driver's attention.
+tenths slower, turned in early." Return "" when nothing changed that is worth \
+the driver's attention.
 - say: at most 10 words, spoken a few seconds before this corner's braking mark \
-next lap. One concrete instruction. Use landmarks, kerbs, bumps and line \
+next lap (the word "Brake" is called separately, right at the mark). One \
+concrete instruction. Use landmarks, kerbs, bumps and line \
 placement from the track brief where useful. Keep the previous wording when it \
 is still right - repetition helps a driver learn.
 - apex_say: at most 4 words spoken just before the apex, or "" (use for a kerb, \
@@ -92,9 +94,20 @@ bump or line reminder that matters, e.g. "Kerb", "Wait for it", "Off the kerb").
 - call_turn / call_throttle: true to also call "Turn in" / "Throttle" at the \
 reference points - only when turn-in or throttle timing is this driver's issue here.
 
+Spoken text rules: the driver cannot see distances or mark positions, so never \
+say metres, mark positions or other numbers. Say "early", "late", "at the mark", \
+"a tenth quicker", gears as words ("second gear"), and landmarks.
+
 Follow the head coach's objective for this corner when there is one. Use only \
 the numbers given. Be calm and plain.
 """
+
+_BAD_SPOKEN = re.compile(r"\d{2,}|\bmet(?:re|er)s?\b|\d\s*m\b|\d\.\d{2,}", re.IGNORECASE)
+
+
+def speakable(text: str) -> bool:
+    """False if spoken *text* contains distances or numbers a driver can't use."""
+    return not _BAD_SPOKEN.search(text)
 
 
 def advisor_schema() -> dict[str, Any]:
@@ -174,6 +187,7 @@ def pass_message(
 class Advice:
     now: str
     note: CornerNote
+    rejected: bool = False  # the model's spoken verdict was unusable
 
 
 class CornerAdvisor:
@@ -184,16 +198,19 @@ class CornerAdvisor:
 
     async def advise(self, message: str, note: CornerNote) -> Advice:
         data = await self._llm.complete_json(self._system, message, self._schema)
+        say = str(data.get("say", note.say)).strip()
+        apex = str(data.get("apex_say", "")).strip()
+        now = str(data.get("now", "")).strip()
         updated = CornerNote(
             corner=note.corner,
-            say=str(data.get("say", note.say)).strip() or note.say,
-            apex_say=str(data.get("apex_say", "")).strip(),
+            say=say if say and speakable(say) else note.say,
+            apex_say=apex if speakable(apex) else note.apex_say,
             call_brake=note.call_brake,
             call_turn=bool(data.get("call_turn", note.call_turn)),
             call_throttle=bool(data.get("call_throttle", note.call_throttle)),
             objective=note.objective,
         )
-        return Advice(now=str(data.get("now", "")).strip(), note=updated)
+        return Advice(now=now if speakable(now) else "", note=updated, rejected=not speakable(now))
 
 
 # -- the per-lap head coach -----------------------------------------------------
@@ -295,9 +312,10 @@ WRITER_RULES = """\
 You write the initial pace notes for a live driving coach in Assetto Corsa. For \
 every corner give:
 - say: at most 10 words, read aloud a few seconds before the corner's braking \
-mark (or turn-in, if it is not braked for). The most useful thing to know \
-going in: braking reference, line placement, a landmark, kerb or bump from the \
-track brief, or the gear.
+mark (or turn-in, if it is not braked for); "Brake" itself is called at the mark. \
+No numbers or distances (the driver cannot see them): use landmarks and gears. \
+The most useful thing to know going in: braking reference, line placement, a \
+landmark, kerb or bump from the track brief, or the gear.
 - apex_say: at most 4 words read just before the apex, or "" if nothing matters there.
 - call_turn / call_throttle: whether to call "Turn in" / "Throttle" at the \
 reference points (use sparingly; start with true only where timing is critical).
@@ -344,10 +362,12 @@ async def write_initial_notes(
         if name not in existing:
             continue
         base = existing[name]
+        say = str(item.get("say", "")).strip()
+        apex = str(item.get("apex_say", "")).strip()
         out[name] = CornerNote(
             corner=name,
-            say=str(item.get("say", "")).strip() or base.say,
-            apex_say=str(item.get("apex_say", "")).strip(),
+            say=say if say and speakable(say) else base.say,
+            apex_say=apex if speakable(apex) else "",
             call_brake=base.call_brake,
             call_turn=bool(item.get("call_turn", False)),
             call_throttle=bool(item.get("call_throttle", False)),

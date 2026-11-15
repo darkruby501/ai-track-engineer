@@ -249,8 +249,9 @@ class LiveCoach:
         advice.note.objective = self.pace.notes[name].objective
         self.pace.notes[name] = advice.note
         self._cues_dirty = True
-        record.said_after = advice.now
-        self._queue_say(advice.now, t, max_age_s=12.0, kind="verdict")
+        now = quick if advice.rejected else advice.now
+        record.said_after = now
+        self._queue_say(now, t, max_age_s=12.0, kind="verdict")
         self._save_state()
         self._event(
             "advice",
