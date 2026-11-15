@@ -166,7 +166,15 @@ async def run_live(
     from src.telemetry.shm_reader import SharedMemoryUnavailableError
     from src.telemetry.shm_structs import ACStatus
 
+    import os
+
     speaker = make_speaker(enabled=settings.voice, rate=settings.voice_rate)
+    if use_llm and not (
+        os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+    ):
+        _log.warning("no-anthropic-key", note="set ANTHROPIC_API_KEY; using basic coaching")
+        speaker.say("No Claude key found. Basic coaching only.")
+        use_llm = False
     ac_path = find_ac_install(get_settings().app.ac_install_path)
     try:
         while True:
