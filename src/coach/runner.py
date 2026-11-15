@@ -40,6 +40,18 @@ def _effort(value: str) -> Effort:
     raise ValueError(f"unknown effort {value!r}")
 
 
+def speaker_from_settings(settings: CoachSettings, *, enabled: bool) -> LogSpeaker:
+    return make_speaker(
+        enabled=enabled,
+        rate=settings.voice_rate,
+        engine=settings.voice_engine,
+        voice=settings.elevenlabs_voice,
+        model=settings.elevenlabs_model,
+        speed=settings.elevenlabs_speed,
+        cache_dir=settings.tts_cache_dir,
+    )
+
+
 def state_stem(track: str, layout: str, car: str) -> str:
     return f"{track}__{layout}__{car}"
 
@@ -140,6 +152,7 @@ async def prepare_notes(coach: LiveCoach, settings: CoachSettings) -> bool:
         return False
     coach.pace.notes.update(notes)
     coach._cues_dirty = True
+    coach.prefetch_notes()
     if coach.state_path is not None:
         coach.pace.save(coach.state_path)
         data = json.loads(coach.state_path.read_text(encoding="utf-8"))
@@ -217,7 +230,7 @@ async def run_live(
     from src.telemetry.shm_reader import SharedMemoryUnavailableError
     from src.telemetry.shm_structs import ACStatus
 
-    speaker = make_speaker(enabled=settings.voice, rate=settings.voice_rate)
+    speaker = speaker_from_settings(settings, enabled=settings.voice)
     if use_llm and not (
         os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
     ):
@@ -274,6 +287,7 @@ async def run_live(
                 log_path=base.with_suffix(".jsonl"),
                 edges=edges,
             )
+            coach.prefetch_notes()
             notes_task = asyncio.get_running_loop().create_task(prepare_notes(coach, settings))
             _log.info("coaching", track=track.name, car=static.car_model, csv=str(writer.path))
             speaker.say("Coach ready.")

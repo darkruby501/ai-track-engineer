@@ -102,6 +102,13 @@ class LiveCoach:
         return self.reference.lap.length_m
 
     # -- public API -----------------------------------------------------------
+    def prefetch_notes(self) -> None:
+        """Ask the speaker to prepare audio for every note (instant playback)."""
+        texts: list[str] = []
+        for note in self.pace.notes.values():
+            texts.extend(t for t in (note.say, note.apex_say) if t)
+        self.speaker.prefetch(texts)
+
     async def feed(self, sample: Sample) -> None:
         prev = self._samples[-1] if self._samples else None
         if prev is not None and sample.lap != prev.lap:
@@ -248,6 +255,7 @@ class LiveCoach:
             return
         advice.note.objective = self.pace.notes[name].objective
         self.pace.notes[name] = advice.note
+        self.speaker.prefetch([t for t in (advice.note.say, advice.note.apex_say) if t])
         self._cues_dirty = True
         now = quick if advice.rejected else advice.now
         record.said_after = now

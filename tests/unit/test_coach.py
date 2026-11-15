@@ -577,3 +577,88 @@ async def test_advisor_filters_unspeakable_text() -> None:
     advice = await advisor.advise("msg", note)
     assert advice.now == "" and advice.rejected
     assert advice.note.say == "Alpha: stay left" and advice.note.apex_say == "Kerb"
+
+
+# -- ElevenLabs speaker ----------------------------------------------------------------
+class _FakePlayer:
+    def __init__(self) -> None:
+        self.played: list[Path] = []
+        self.stops = 0
+
+    def play(self, path: Path) -> None:
+        self.played.append(path)
+
+    def stop(self) -> None:
+        self.stops += 1
+
+
+def _eleven(
+    tmp_path: Path, *, fail: bool = False
+) -> tuple[Any, list[dict[str, Any]], _FakePlayer, LogSpeaker]:
+    from src.coach.speaker import ElevenLabsSpeaker
+
+    posts: list[dict[str, Any]] = []
+
+    def post(url: str, headers: dict[str, str], body: dict[str, Any]) -> bytes:
+        if fail:
+            raise RuntimeError("network")
+        posts.append({"url": url, "body": body, "headers": headers})
+        return b"\x00\x00" * 2205  # 0.1 s of silence
+
+    def get(url: str, headers: dict[str, str]) -> dict[str, Any]:
+        return {
+            "voices": [
+                {"name": "Rachel", "voice_id": "r1"},
+                {"name": "Brian - deep", "voice_id": "b1"},
+            ]
+        }
+
+    player, fallback = _FakePlayer(), LogSpeaker()
+    speaker = ElevenLabsSpeaker(
+        "key",
+        cache_dir=tmp_path,
+        fallback=fallback,
+        player=player,
+        http_post=post,
+        http_get=get,
+        start_threads=False,
+    )
+    return speaker, posts, player, fallback
+
+
+def test_elevenlabs_caches_audio_and_picks_a_voice(tmp_path: Path) -> None:
+    from src.coach.speaker import wav_seconds
+
+    speaker, posts, player, _ = _eleven(tmp_path)
+    speaker.prefetch(["Brake", "Brake", ""])
+    assert speaker.prefetch_next() and not speaker.prefetch_next()
+    assert len(posts) == 1 and "/text-to-speech/b1?" in posts[0]["url"]
+    assert posts[0]["body"]["model_id"] == "eleven_flash_v2_5"
+    assert posts[0]["headers"] == {"xi-api-key": "key"}
+    speaker.say("Brake")
+    assert speaker.play_next() and len(posts) == 1  # served from the cache
+    assert wav_seconds(player.played[0].read_bytes()) == pytest.approx(0.1)
+    assert speaker.cached("Brake") and not speaker.cached("Throttle")
+
+
+def test_elevenlabs_urgent_interrupts_and_queues(tmp_path: Path) -> None:
+    speaker, _, player, _ = _eleven(tmp_path)
+    speaker.say("first")
+    speaker.say("second")
+    assert speaker.play_next()
+    assert not speaker.play_next()  # still "playing" the first for 0.1 s
+    speaker.say("Brake", urgent=True)  # drops "second", stops playback
+    assert player.stops == 1
+    assert speaker.play_next()
+    assert player.played[-1].name == speaker._cache_path("Brake").name
+    assert speaker.spoken == ["first", "second", "Brake"]
+
+
+def test_elevenlabs_falls_back_to_system_voice(tmp_path: Path) -> None:
+    speaker, _, player, fallback = _eleven(tmp_path, fail=True)
+    speaker.say("Brake", urgent=True)
+    assert speaker.play_next()
+    assert fallback.spoken == ["Brake"] and speaker.failures == 1 and player.played == []
+    speaker.prefetch(["Throttle"])
+    assert speaker.prefetch_next() and speaker.failures == 2
+    speaker.close()

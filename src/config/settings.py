@@ -76,6 +76,13 @@ class CoachSettings(BaseModel):
     pace_lead_s: float = 3.5  # approach sentence starts this long before the mark
     cue_latency_s: float = 0.35  # say cue words this early to absorb TTS delay
     fast_model: str = "claude-haiku-5-5"  # per-corner verdicts and note updates
+    # Voice: "auto" uses ElevenLabs when ELEVENLABS_API_KEY is set, else the
+    # system voice; "system" forces the system voice.
+    voice_engine: str = "auto"
+    elevenlabs_voice: str = ""  # voice name or id; "" = first of Brian/Adam/George/...
+    elevenlabs_model: str = "eleven_flash_v2_5"
+    elevenlabs_speed: float = 1.1
+    tts_cache_dir: str = "data/local/tts_cache"
 
 
 class AppSettings(BaseModel):

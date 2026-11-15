@@ -107,15 +107,14 @@ def coach_replay(
 ) -> None:  # pragma: no cover - integration
     """Run the coach over a recorded session, printing what it would say."""
     from src.coach.reference import load_reference, reference_path
-    from src.coach.runner import build_coach, prepare_notes, replay
+    from src.coach.runner import build_coach, prepare_notes, replay, speaker_from_settings
     from src.coach.samples import CSV_COLUMNS, read_samples_csv
-    from src.coach.speaker import make_speaker
     from src.knowledge.track_edges import load_edges
 
     settings = get_settings()
     configure_logging(settings.app.log_level)
     reference = load_reference(reference_path(settings.coach.reference_dir, track, layout, car))
-    speaker = make_speaker(enabled=voice, rate=settings.coach.voice_rate)
+    speaker = speaker_from_settings(settings.coach, enabled=voice)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     log_path = Path(settings.coach.sessions_dir) / f"replay_{stamp}.jsonl"
     if track_dir is None:
