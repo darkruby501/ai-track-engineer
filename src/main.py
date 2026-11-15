@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
+from typing import Annotated
 
 import typer
 from fastapi import FastAPI
@@ -36,6 +37,134 @@ app = typer.Typer(
     add_completion=False,
     no_args_is_help=True,
 )
+
+
+coach_app = typer.Typer(help="Claude-powered driving coach.", no_args_is_help=True)
+app.add_typer(coach_app, name="coach")
+
+
+def _coach_track(track: str, layout: str) -> TrackInfo:
+    settings = get_settings()
+    ac_path = find_ac_install(settings.app.ac_install_path)
+    track_dir = Path(ac_path) / "content" / "tracks" / track if ac_path else Path(track)
+    return load_track(track_dir, track_id=track, layout=layout)
+
+
+@coach_app.command("run")
+def coach_run(
+    offline: bool = typer.Option(
+        False, "--offline", help="No Claude calls: simple built-in coaching only."
+    ),
+    no_voice: bool = typer.Option(False, "--no-voice", help="Log calls instead of speaking."),
+) -> None:  # pragma: no cover - needs Assetto Corsa
+    """Coach live AC sessions (run this on the sim PC, from the desktop)."""
+    from src.coach.runner import run_live
+
+    settings = get_settings()
+    configure_logging(settings.app.log_level)
+    coach_settings = settings.coach.model_copy(update={"voice": not no_voice})
+    poll_hz = settings.app.telemetry_poll_hz
+    asyncio.run(run_live(coach_settings, use_llm=not offline, poll_hz=poll_hz))
+
+
+@coach_app.command("make-reference")
+def coach_make_reference(
+    csv_path: Annotated[Path, typer.Argument(help="Recording (AI reference or coach CSV).")],
+    track: str = typer.Option("nd_buttonwillow", help="AC track folder name."),
+    layout: str = typer.Option("layout_classic_13", help="AC layout folder name."),
+    car: str = typer.Option("ks_mazda_miata", help="AC car folder name."),
+    length_m: float = typer.Option(..., "--length-m", help="Track spline length in metres."),
+    source: str = typer.Option("AC AI", help="Where the lap came from (shown to the coach)."),
+) -> None:
+    """Save the fastest flying lap of a recording as the reference lap."""
+    from src.coach.runner import make_reference
+
+    out = make_reference(
+        csv_path,
+        track=track,
+        layout=layout,
+        car=car,
+        length_m=length_m,
+        out_dir=Path(get_settings().coach.reference_dir),
+        source=source,
+    )
+    typer.echo(f"reference saved: {out}")
+
+
+@coach_app.command("replay")
+def coach_replay(
+    csv_path: Annotated[Path, typer.Argument(help="Recorded session CSV.")],
+    track: str = typer.Option("nd_buttonwillow"),
+    layout: str = typer.Option("layout_classic_13"),
+    car: str = typer.Option("ks_mazda_miata"),
+    offline: bool = typer.Option(False, "--offline", help="No Claude calls."),
+    voice: bool = typer.Option(False, "--voice", help="Speak calls (Mac/Windows)."),
+    realtime: float = typer.Option(0.0, help="Playback speed; 0 = as fast as possible."),
+    max_laps: int = typer.Option(0, help="Stop after this many laps (0 = all)."),
+) -> None:  # pragma: no cover - integration
+    """Run the coach over a recorded session, printing what it would say."""
+    from src.coach.reference import load_reference, reference_path
+    from src.coach.runner import build_coach, replay
+    from src.coach.samples import read_samples_csv
+    from src.coach.speaker import make_speaker
+
+    settings = get_settings()
+    configure_logging(settings.app.log_level)
+    reference = load_reference(reference_path(settings.coach.reference_dir, track, layout, car))
+    speaker = make_speaker(enabled=voice, rate=settings.coach.voice_rate)
+    log_path = Path(settings.coach.sessions_dir) / f"replay_{time.strftime('%Y%m%d-%H%M%S')}.jsonl"
+    coach = build_coach(
+        settings.coach,
+        track=_coach_track(track, layout),
+        reference=reference,
+        speaker=speaker,
+        use_llm=not offline,
+        log_path=log_path,
+    )
+    source = csv_path
+    if max_laps > 0:
+        import csv as _csv
+        import tempfile
+
+        rows = list(read_samples_csv(csv_path))
+        first = rows[0].lap
+        keep = [s for s in rows if s.lap <= first + max_laps]
+        tmp = Path(tempfile.mkstemp(suffix=".csv")[1])
+        from src.coach.samples import CSV_COLUMNS
+
+        with tmp.open("w", newline="", encoding="utf-8") as fh:
+            writer = _csv.writer(fh)
+            writer.writerow(CSV_COLUMNS)
+            writer.writerows(s.row() for s in keep)
+        source = tmp
+    asyncio.run(replay(coach, source, realtime=realtime))
+    typer.echo("\nSpoken:")
+    for line in speaker.spoken:
+        typer.echo(f"  > {line}")
+    typer.echo(f"\nlog: {log_path}")
+
+
+@coach_app.command("debrief")
+def coach_debrief(
+    csv_path: Annotated[Path, typer.Argument(help="Session CSV written by `coach run`.")],
+    track: str = typer.Option("nd_buttonwillow"),
+    layout: str = typer.Option("layout_classic_13"),
+    car: str = typer.Option("ks_mazda_miata"),
+) -> None:  # pragma: no cover - network
+    """Write a Claude debrief of a recorded session next to its CSV."""
+    from src.coach.reference import load_reference, reference_path
+    from src.coach.runner import debrief
+
+    settings = get_settings()
+    configure_logging(settings.app.log_level)
+    reference = load_reference(reference_path(settings.coach.reference_dir, track, layout, car))
+    text = asyncio.run(
+        debrief(settings.coach, csv_path, reference=reference, track=_coach_track(track, layout))
+    )
+    out = csv_path.with_name(csv_path.stem + "_debrief.md")
+    out.write_text(text, encoding="utf-8")
+    typer.echo(text)
+    typer.echo(f"\nsaved: {out}")
 
 
 @app.command()

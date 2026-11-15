@@ -40,6 +40,39 @@ class OllamaSettings(BaseModel):
     model: str = "mistral"
 
 
+class CoachSettings(BaseModel):
+    """Settings for the Claude-powered driving coach (``coach`` command).
+
+    The Anthropic API key is never configured here: the SDK reads
+    ``ANTHROPIC_API_KEY`` (or an ``ant auth login`` profile) from the environment.
+    """
+
+    model: str = "claude-opus-5-5"
+    # Effort for the between-laps corner calls (latency-sensitive) and for the
+    # post-session debrief (quality-sensitive).
+    lap_effort: str = "low"
+    debrief_effort: str = "high"
+    # "standard" or "fast" (fast mode costs 2x but answers sooner).
+    speed: str = "standard"
+    request_timeout_s: float = 45.0
+    # Reference laps live in ``<reference_dir>/<track>__<layout>__<car>.json``.
+    reference_dir: str = "data/local/reference"
+    # Markdown files folded into the coach's (cached) system prompt.
+    context_files: list[str] = Field(
+        default_factory=lambda: [
+            "docs/tracks/buttonwillow-13cw-guide.md",
+            "data/local/driver-notes-bw13.md",
+            "data/local/driver-real-lap-bw13.md",
+        ]
+    )
+    sessions_dir: str = "data/sessions"
+    voice: bool = True
+    voice_rate: int = 2
+    # Seconds of warning before the reference braking point for a corner call.
+    call_lead_s: float = 4.5
+    max_calls_per_lap: int = 2
+
+
 class AppSettings(BaseModel):
     """General application tunables."""
 
@@ -68,6 +101,7 @@ class Settings(BaseSettings):
     app: AppSettings = Field(default_factory=AppSettings)
     influxdb: InfluxSettings = Field(default_factory=InfluxSettings)
     ollama: OllamaSettings = Field(default_factory=OllamaSettings)
+    coach: CoachSettings = Field(default_factory=CoachSettings)
 
     @classmethod
     def settings_customise_sources(
