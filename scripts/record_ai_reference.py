@@ -165,6 +165,8 @@ def main() -> int:
     ap.add_argument("--timeout-min", type=float, default=30.0)
     ap.add_argument("--out-dir", default="data/sessions")
     ap.add_argument("--keep-running", action="store_true", help="leave AC running afterwards")
+    ap.add_argument("--ai-attempts", type=int, default=1, help="times to send the AI shortcut")
+    ap.add_argument("--ai-wait-s", type=float, default=60.0, help="wait for movement per attempt")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -220,13 +222,27 @@ def main() -> int:
         hwnds = windows_for_pid(pid) if pid else []
         log(f"acs.exe pid={pid} windows={hwnds}")
         moving = False
-        for attempt, chord in enumerate((["ctrl", "c"], ["ctrl", "c"], ["c"]), start=1):
+        for attempt in range(1, args.ai_attempts + 1):
             if hwnds:
                 log(f"focus window -> {focus_window(hwnds[0])}")
             time.sleep(0.5)
-            log(f"attempt {attempt}: sending {'+'.join(chord)}")
-            send_chord(chord)
-            moving = wait_for(lambda: source.read_frame().physics.speed_kmh > 15.0, 20, 0.25)
+            log(f"attempt {attempt}: sending ctrl+c")
+            send_chord(["ctrl", "c"])
+            deadline_ai = time.monotonic() + args.ai_wait_s
+            next_report = 0.0
+            while time.monotonic() < deadline_ai:
+                f = source.read_frame()
+                p = f.physics
+                if time.monotonic() >= next_report:
+                    log(
+                        f"  speed={p.speed_kmh:.1f} gas={p.gas:.2f} brake={p.brake:.2f} "
+                        f"gear={p.gear - 1} rpm={p.rpm} status={f.graphics.status.name}"
+                    )
+                    next_report = time.monotonic() + 3.0
+                if p.speed_kmh > 15.0:
+                    moving = True
+                    break
+                time.sleep(0.25)
             if moving:
                 log("AI is driving (speed > 15 km/h)")
                 break
