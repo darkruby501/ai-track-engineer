@@ -208,7 +208,13 @@ def test_plan_schema_restricts_corners() -> None:
     schema = plan_schema(["Alpha", "Bravo"], 2)
     item = schema["properties"]["calls"]["items"]
     assert item["properties"]["corner"]["enum"] == ["Alpha", "Bravo"]
-    assert schema["properties"]["calls"]["maxItems"] == 2
+    assert "maxItems" not in schema["properties"]["calls"]  # unsupported by the API
+    many = {
+        "lap_comment": "",
+        "notes": "",
+        "calls": [{"corner": "Alpha", "say": f"call {i}", "why": ""} for i in range(4)],
+    }
+    assert len(CoachPlan.from_json(many, valid_corners={"Alpha"}, max_calls=2).calls) == 2
 
 
 def test_coach_plan_from_json_drops_unknown_corners() -> None:

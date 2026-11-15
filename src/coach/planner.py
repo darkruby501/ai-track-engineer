@@ -71,12 +71,14 @@ class CoachPlan:
     usage: dict[str, Any] | None = None  # tokens and estimated cost of the call
 
     @classmethod
-    def from_json(cls, data: dict[str, Any], *, valid_corners: set[str]) -> CoachPlan:
+    def from_json(
+        cls, data: dict[str, Any], *, valid_corners: set[str], max_calls: int = 2
+    ) -> CoachPlan:
         calls = [
             CornerCall(corner=c["corner"], say=c["say"].strip(), why=c.get("why", ""))
             for c in data.get("calls", [])
             if c.get("corner") in valid_corners and c.get("say", "").strip()
-        ]
+        ][:max_calls]
         return cls(
             lap_comment=str(data.get("lap_comment", "")).strip(),
             calls=calls,
@@ -113,9 +115,9 @@ def plan_schema(corner_names: list[str], max_calls: int) -> dict[str, Any]:
         "type": "object",
         "properties": {
             "lap_comment": {"type": "string"},
+            # Structured outputs reject "maxItems"; the limit is enforced in code.
             "calls": {
                 "type": "array",
-                "maxItems": max_calls,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -196,6 +198,7 @@ class CoachPlanner:
         self._system = system_prompt
         self._corners = corner_names
         self._schema = plan_schema(corner_names, max_calls)
+        self._max_calls = max_calls
         self._ref_time = reference_time_s
         self._history_laps = history_laps
         self.history: list[LapRecord] = []
@@ -217,7 +220,9 @@ class CoachPlanner:
             flags=flags or [],
         )
         data = await self._llm.complete_json(self._system, message, self._schema)
-        plan = CoachPlan.from_json(data, valid_corners=set(self._corners))
+        plan = CoachPlan.from_json(
+            data, valid_corners=set(self._corners), max_calls=self._max_calls
+        )
         last = getattr(self._llm, "last", None)
         plan.usage = last.as_dict() if last is not None else None
         worst = sorted(((r.name, r.time_lost_s) for r in rows), key=lambda x: -x[1])[:3]
