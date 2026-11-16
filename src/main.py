@@ -202,7 +202,6 @@ def coach_target_line(
         np.c_[right[:, 0], -right[:, 2]],
         ref_s=reference.lap.s,
         ref_speed_kmh=reference.lap.speed,
-        corner_spans=spans,
         car=CarModel(lat_g=lat_g, brake_g=brake_g),
         base_margin_m=base_margin_m,
         risk_zones=DEFAULT_RISK_ZONES.get((track, layout), []),

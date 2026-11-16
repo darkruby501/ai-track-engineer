@@ -28,6 +28,7 @@ from scipy.optimize import lsq_linear
 
 G = 9.81
 SPEED, GAS, BRAKE, RADIUS, SIDE_L, SIDE_R, LENGTH_X = 0, 1, 2, 4, 5, 6, 12
+BRAKE_DROP_KMH = 9.0  # a slow-down smaller than this is a lift, not a brake zone
 FX, FZ = 13, 15
 
 
@@ -201,19 +202,22 @@ class TargetLine:
     margins: NDArray[np.float64] = field(repr=False, default_factory=lambda: np.zeros(0))
 
     def brake_points(self, spans: list[tuple[str, float, float]]) -> dict[str, float]:
-        """Target braking point (spline metres) for corners that need braking."""
+        """Target braking point (spline metres) for corners that need braking.
+
+        Each red (brake) zone of the ideal line belongs to the first corner that
+        ends after it; its start is that corner's mark, so "Brake" is called
+        exactly where the line turns red.
+        """
+        _, brake = pedal_flags(self.s_spline, self.v)
+        on = brake > 0.5
+        starts = np.flatnonzero(on & ~np.roll(on, 1))
+        ends = np.flatnonzero(on & ~np.roll(on, -1))
         out: dict[str, float] = {}
-        prev_min = 0
-        for name, start_m, end_m in spans:
-            idx = np.flatnonzero((self.s_spline >= start_m) & (self.s_spline <= end_m))
-            if idx.size == 0:
-                continue
-            i_min = int(idx[np.argmin(self.v[idx])])
-            lo = min(prev_min, i_min)
-            i_peak = lo + int(np.argmax(self.v[lo : i_min + 1]))
-            if self.v[i_peak] - self.v[i_min] > 3.0 / 3.6 * 3:  # > ~9 km/h drop = braking
-                out[name] = float(self.s_spline[i_peak])
-            prev_min = i_min
+        for a, b in zip(starts, ends if ends[0] >= starts[0] else np.roll(ends, -1), strict=True):
+            end_m = float(self.s_spline[b])
+            owner = next((name for name, _, stop in spans if stop >= end_m), None)
+            if owner is not None and owner not in out:
+                out[owner] = float(self.s_spline[a])
         return out
 
 
@@ -240,6 +244,55 @@ def build_target_line(
     return TargetLine(offsets, xz, s_spline, v, kappa, lap_time, margins)
 
 
+def pedal_flags(
+    s: NDArray[np.float64],
+    v: NDArray[np.float64],
+    *,
+    brake_drop_kmh: float = BRAKE_DROP_KMH,
+    trail_g: float = 0.35,
+    min_run_m: float = 12.0,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """``(gas, brake)`` per point, as AC colours the ideal line (iRacing style).
+
+    Each stretch where the speed never rises is one slow-down. If it loses at
+    least *brake_drop_kmh* it is braking (red) from its first falling point to
+    its last point slowing harder than *trail_g*, then coasting (white) into
+    the apex; a smaller slow-down is a lift (white). Everything else is
+    throttle (green). Runs shorter than *min_run_m* take the colour before
+    them, so the line never flickers.
+    """
+    n = len(v)
+    dv = np.roll(v, -1) - v
+    falling = dv < -0.02
+    seg = np.r_[np.diff(s), 0.0]
+    decel_g = (v**2 - np.roll(v, -1) ** 2) / (2 * np.maximum(seg, 1e-3) * G)
+    label = np.zeros(n, dtype=np.int8)  # 0 throttle, 1 coast, 2 brake
+    i = 0
+    while i < n:
+        if dv[i] > 0.005:
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and dv[j + 1] <= 0.005:
+            j += 1
+        drops = np.flatnonzero(falling[i : j + 1])
+        if drops.size:
+            a, b = i + int(drops[0]), i + int(drops[-1])
+            lost_kmh = (v[a] - v[min(b + 1, n - 1)]) * 3.6
+            label[a : b + 1] = 1
+            hard = np.flatnonzero(decel_g[a : b + 1] >= trail_g)
+            if lost_kmh >= brake_drop_kmh and hard.size:
+                label[a : a + int(hard[-1]) + 1] = 2
+        i = j + 1
+    start = 0
+    for k in range(1, n + 1):
+        if k == n or label[k] != label[start]:
+            if start > 0 and float(np.sum(seg[start:k])) < min_run_m:
+                label[start:k] = label[start - 1]
+            start = k
+    return (label == 0).astype(np.float64), (label == 2).astype(np.float64)
+
+
 def to_ideal_line(spline: AiSpline, target: TargetLine) -> AiSpline:
     """A copy of *spline* moved onto the target line, with its speeds."""
     pts = spline.points.copy()
@@ -248,9 +301,7 @@ def to_ideal_line(spline: AiSpline, target: TargetLine) -> AiSpline:
     pts[:, 3] = np.r_[0.0, np.cumsum(seg)[:-1]]
     extra = spline.extra.copy()
     extra[:, SPEED] = target.v
-    dv = np.roll(target.v, -1) - target.v
-    extra[:, GAS] = np.where(dv >= -0.01, 1.0, 0.0)
-    extra[:, BRAKE] = np.where(dv < -0.05, 1.0, 0.0)
+    extra[:, GAS], extra[:, BRAKE] = pedal_flags(pts[:, 3], target.v)
     extra[:, RADIUS] = 1.0 / np.maximum(np.abs(target.kappa), 1e-6)
     extra[:, SIDE_L] = spline.extra[:, SIDE_L] + target.offsets
     extra[:, SIDE_R] = spline.extra[:, SIDE_R] - target.offsets
@@ -286,26 +337,80 @@ def margin_offsets(
     )
 
 
+def turning_points(x: NDArray[np.float64], min_swing: float) -> list[int]:
+    """Alternating peaks and troughs of a closed trace, ignoring swings < *min_swing*.
+
+    Returned in order, starting with the global maximum.
+    """
+    n = len(x)
+    start = int(np.argmax(x))
+    order = (np.arange(n) + start) % n
+    pts, cand, falling = [start], start, True
+    for i in order[1:]:
+        if falling:
+            if x[i] < x[cand]:
+                cand = int(i)
+            elif x[i] - x[cand] > min_swing:
+                pts.append(cand)
+                cand, falling = int(i), False
+        else:
+            if x[i] > x[cand]:
+                cand = int(i)
+            elif x[cand] - x[i] > min_swing:
+                pts.append(cand)
+                cand, falling = int(i), True
+    if not falling:  # the lap ends climbing back to the global maximum
+        return pts
+    pts.append(cand)
+    return pts
+
+
+def monotone_envelope(
+    ref: NDArray[np.float64], slow_factor: float, *, min_swing_kmh: float = 5.0
+) -> NDArray[np.float64]:
+    """Speed cap that only falls into each slow point and only rises out of it.
+
+    From each peak to the next trough the cap is *slow_factor* x the
+    reference, never rising (its wobbles flattened); from each trough to the
+    next peak it is the reference less the trough's margin (fading out by the
+    peak), never falling.
+    Lifts smaller than *min_swing_kmh* are ignored.
+    """
+    n = len(ref)
+    pts = turning_points(ref, min_swing_kmh / 3.6)
+    cap = ref.copy()
+    for k, a in enumerate(pts):
+        b = pts[(k + 1) % len(pts)]
+        idx = (np.arange(a, a + (b - a) % n + 1)) % n
+        if ref[a] >= ref[b]:  # peak -> trough: slow down, never speed up
+            cap[idx] = np.minimum.accumulate(ref[idx] * slow_factor)
+        else:  # trough -> peak: speed up, never slow down; the trough's margin
+            # fades out so the next straight ends at full speed (early brake points)
+            fade = np.linspace(1.0, 0.0, len(idx) - 1)
+            out = ref[idx[1:]] - (1.0 - slow_factor) * ref[a] * fade
+            cap[idx[1:]] = np.minimum.accumulate(out[::-1])[::-1]
+    return cap
+
+
 def profile_from_reference(
     s_spline: NDArray[np.float64],
     ref_speed_ms: NDArray[np.float64],
     xz: NDArray[np.float64],
-    corner_spans: list[tuple[str, float, float]],
     car: CarModel,
     *,
     corner_speed_factor: float = 0.95,
 ) -> NDArray[np.float64]:
-    """Target speeds: the reference's corner speeds scaled down, braking at ``car.brake_g``.
+    """Target speeds: the reference's slow-downs scaled down, braking at ``car.brake_g``.
 
-    Inside corner spans the cap is ``corner_speed_factor`` x the reference speed;
-    on straights only power limits apply. A forward pass applies acceleration
-    limits and a backward pass applies the (gentler) braking.
+    The cap is :func:`monotone_envelope` of the reference (``corner_speed_factor``
+    x the reference while it slows, the reference while it speeds up). A forward
+    pass applies acceleration limits and a backward pass the (gentler) braking.
     """
     n = len(s_spline)
-    in_corner = np.zeros(n, dtype=bool)
-    for _, a, b in corner_spans:
-        in_corner |= (s_spline >= a) & (s_spline <= b)
-    cap = np.where(in_corner, ref_speed_ms * corner_speed_factor, car.top_speed_kmh / 3.6)
+    cap = np.minimum(
+        monotone_envelope(np.asarray(ref_speed_ms, dtype=np.float64), corner_speed_factor),
+        car.top_speed_kmh / 3.6,
+    )
     seg = np.hypot(*(np.roll(xz, -1, axis=0) - xz).T)
     v = cap.copy()
     for _ in range(3):
@@ -334,7 +439,6 @@ def build_conservative_target(
     *,
     ref_s: NDArray[np.float64],
     ref_speed_kmh: NDArray[np.float64],
-    corner_spans: list[tuple[str, float, float]],
     car: CarModel,
     half_width_m: float = 0.84,
     base_margin_m: float = 0.3,
@@ -349,9 +453,7 @@ def build_conservative_target(
     off = margin_offsets(spline, half_width_m=half_width_m, wheel_margin_m=margins)
     xz = spline.xz + orient_normals(spline, edges_right_xz) * off[:, None]
     v_ref = np.interp(s, ref_s, ref_speed_kmh) / 3.6
-    v = profile_from_reference(
-        s, v_ref, xz, corner_spans, car, corner_speed_factor=corner_speed_factor
-    )
+    v = profile_from_reference(s, v_ref, xz, car, corner_speed_factor=corner_speed_factor)
     seg = np.hypot(*(np.roll(xz, -1, axis=0) - xz).T)
     lap = float(np.sum(seg / np.maximum(v, 1.0)))
     return TargetLine(off, xz, s, v, curvature(xz), lap, margins)

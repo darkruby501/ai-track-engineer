@@ -9,17 +9,21 @@ import pytest
 from src.coach.metrics import compare, measure_lap
 from src.coach.pacenotes import CornerNote, PaceNotes, PassRecord, quick_verdict, template_note
 from src.coach.target_line import (
+    BRAKE,
     SIDE_L,
     SIDE_R,
     AiSpline,
     CarModel,
     build_conservative_target,
     margin_offsets,
+    monotone_envelope,
     orient_normals,
+    pedal_flags,
     profile_from_reference,
     read_ai_spline,
     speed_profile,
     to_ideal_line,
+    turning_points,
     write_ai_spline,
 )
 
@@ -91,33 +95,79 @@ def test_speed_profiles_respect_limits() -> None:
     s, v, kappa = speed_profile(spline.xz, car)
     corner = np.abs(kappa) > 1 / 70
     assert v[corner].max() == pytest.approx(np.sqrt(0.9 * 9.81 * 60), rel=0.08)
-    spans = [("A", 300.0, 300 + np.pi * 60)]
-    ref = np.full(spline.n, 30.0)
-    vp = profile_from_reference(spline.points[:, 3], ref, spline.xz, spans, car)
-    in_a = (spline.points[:, 3] >= 300) & (spline.points[:, 3] <= 300 + np.pi * 60)
-    assert vp[in_a].max() <= 30.0 * 0.95 + 1e-6
+    s_m = spline.points[:, 3]
+    ref = _ref_with_corners(s_m) / 3.6
+    vp = profile_from_reference(s_m, ref, spline.xz, car)
+    in_a = (s_m >= 330) & (s_m <= 360)
+    assert vp[in_a].max() <= 60.0 / 3.6 * 0.95 + 1e-6
+    assert np.all(vp <= ref + 1e-6)  # never faster than the reference
     seg = np.hypot(*(np.roll(spline.xz, -1, axis=0) - spline.xz).T)
     decel = (vp**2 - np.roll(vp, -1) ** 2) / (2 * seg)
     assert decel.max() <= 0.95 * 9.81 + 1e-3
 
 
+def _ref_with_corners(s_m: np.ndarray, wobble: float = 0.0) -> np.ndarray:
+    """Reference speed (km/h): 120 on straights, 60 through each half circle."""
+    per = 2 * 300 + 2 * np.pi * 60
+    corner = ((s_m > 300) & (s_m < 300 + np.pi * 60)) | (s_m > per - np.pi * 60)
+    base = np.where(corner, 60.0, 120.0)
+    k = 15
+    smooth = np.convolve(np.r_[base[-k:], base, base[:k]], np.ones(k) / k, "same")[k:-k]
+    return smooth + wobble * np.sin(s_m / 4.0)
+
+
+def test_monotone_envelope_flattens_wobbles() -> None:
+    s_m = _oval().points[:, 3]
+    ref = _ref_with_corners(s_m, wobble=1.0) / 3.6  # +-1 km/h noise
+    cap = monotone_envelope(ref, 0.95)
+    pts = turning_points(ref, 5.0 / 3.6)
+    assert len(pts) == 4  # peak, trough, peak, trough: the noise is ignored
+    a, b = pts[0], pts[1]
+    assert np.all(np.diff(cap[a : b + 1]) <= 1e-9)  # only falls into the corner
+    assert np.all(cap <= ref + 1e-9)
+
+
+def test_pedal_flags_one_brake_zone_then_coast() -> None:
+    s = np.arange(0.0, 600.0, 1.5)
+    v = np.full(s.size, 40.0)
+    brake = (s >= 100) & (s < 160)
+    v[brake] = 40.0 - (s[brake] - 100) * 0.3  # hard braking 40 -> 22 m/s
+    v[(s >= 160) & (s < 200)] = 22.0 - (s[(s >= 160) & (s < 200)] - 160) * 0.02  # roll in
+    v[s >= 200] = np.minimum(21.2 + (s[s >= 200] - 200) * 0.1, 40.0)
+    lift = (s >= 400) & (s < 420)
+    v[lift] -= np.linspace(0, 1.0, np.count_nonzero(lift))  # a 3.6 km/h lift
+    gas, br = pedal_flags(s, v)
+    red = br > 0.5
+    starts = np.flatnonzero(red & ~np.roll(red, 1))
+    assert len(starts) == 1 and s[starts[0]] == pytest.approx(100.0, abs=3)
+    coast = (gas < 0.5) & ~red
+    assert coast[(s > 165) & (s < 195)].all()  # white into the apex
+    assert not red[(s > 390) & (s < 430)].any()  # a small lift is never red
+    assert gas[(s > 230) & (s < 390)].all()
+
+
 def test_build_target_and_ideal_line() -> None:
     spline = _oval()
     edge = _right_edge(spline)
+    s_m = spline.points[:, 3]
     target = build_conservative_target(
         spline,
         edge,
-        ref_s=spline.points[:, 3],
-        ref_speed_kmh=np.full(spline.n, 100.0),
-        corner_spans=[("A", 300.0, 300 + np.pi * 60), ("B", 900.0, 900 + np.pi * 60)],
+        ref_s=s_m,
+        ref_speed_kmh=_ref_with_corners(s_m),
         car=CarModel(),
         risk_zones=[(0.0, 50.0, 1.0)],
     )
     assert target.lap_time_s > 0
-    marks = target.brake_points([("A", 300.0, 300 + np.pi * 60)])
-    assert "A" in marks and marks["A"] < 300.0
+    spans = [("A", 300.0, 300 + np.pi * 60), ("B", 900.0, 900 + np.pi * 60)]
+    marks = target.brake_points(spans)
+    assert set(marks) == {"A", "B"} and marks["A"] < 300.0
     ideal = to_ideal_line(spline, target)
     assert ideal.n == spline.n and ideal.extra[:, 0].max() > 0
+    red = ideal.extra[:, BRAKE] > 0.5
+    assert np.count_nonzero(red & ~np.roll(red, 1)) == 2  # one brake zone per corner
+    assert ideal.extra[:, BRAKE][red].min() == 1.0
+    assert marks["A"] == pytest.approx(s_m[np.flatnonzero(red & ~np.roll(red, 1))[0]])
 
 
 # -- pace notes -----------------------------------------------------------------
