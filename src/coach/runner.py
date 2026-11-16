@@ -15,7 +15,7 @@ from src.ai.anthropic_client import AnthropicClient, Effort
 from src.coach.coaches import CoachContext, CornerAdvisor, HeadCoach, write_initial_notes
 from src.coach.live import LiveCoach
 from src.coach.metrics import CornerComparison, compare, comparison_table, measure_lap
-from src.coach.pacenotes import PaceNotes
+from src.coach.pacenotes import PaceNotes, estimate_speech_s
 from src.coach.reference import (
     Reference,
     best_lap,
@@ -87,6 +87,7 @@ def build_coach(
         lead_s=settings.pace_lead_s,
         latency_s=settings.cue_latency_s,
     )
+    pace.speech_s = lambda text: speaker.seconds(text) or estimate_speech_s(text)
     state_path = Path(settings.notes_dir) / f"{stem}__notes.json"
     state = PaceNotes.load_state(state_path)
     state.pop("marks", None)  # marks always come from the current target

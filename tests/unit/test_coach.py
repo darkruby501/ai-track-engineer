@@ -639,6 +639,8 @@ def test_elevenlabs_caches_audio_and_picks_a_voice(tmp_path: Path) -> None:
     assert speaker.play_next() and len(posts) == 1  # served from the cache
     assert wav_seconds(player.played[0].read_bytes()) == pytest.approx(0.1)
     assert speaker.cached("Brake") and not speaker.cached("Throttle")
+    assert speaker.seconds(" Brake ") == pytest.approx(0.1)
+    assert speaker.seconds("Throttle") is None and LogSpeaker().seconds("Brake") is None
 
 
 def test_elevenlabs_urgent_interrupts_and_queues(tmp_path: Path) -> None:

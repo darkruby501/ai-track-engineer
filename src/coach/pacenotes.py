@@ -10,19 +10,38 @@ driver hits them.
 Cue positions are computed from the reference lap: speech is started a little
 before each point to absorb text-to-speech latency, and the approach sentence
 is spoken a few seconds before the mark so it finishes before "Brake".
+Cues are then scheduled so no phrase is cut off by the next one: notes move
+earlier where there is room, and where there is none the less important cue
+is dropped ("Brake" and "Turn in" are never moved or dropped for a note).
 """
 
 from __future__ import annotations
 
 import json
+import re
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from src.coach.metrics import CornerComparison, CornerMetrics
 from src.coach.samples import LapTrace
 
 GEAR_WORDS = {1: "first", 2: "second", 3: "third", 4: "fourth", 5: "fifth"}
+
+_WORD = re.compile(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)?")
+# Cue priority when two cannot both be said: a note never displaces "Brake" or
+# "Turn in"; "Throttle" gives way to a note (notes often cover the throttle).
+_PRIORITY = {"brake": 4, "turn": 4, "approach": 3, "apex": 2, "throttle": 1}
+# How much earlier than planned a note may start, in seconds.
+_MAX_ADVANCE_S = {"approach": 3.0, "apex": 2.0}
+
+
+def estimate_speech_s(text: str) -> float:
+    """Seconds to say *text*: fitted to the ElevenLabs voice at speed 1.1, plus 0.2 s."""
+    return 0.65 + 0.23 * len(_WORD.findall(text)) + 0.25 * text.count(",")
 
 
 @dataclass
@@ -48,6 +67,16 @@ class Cue:
     at_m: float
     text: str
     urgent: bool
+
+
+@dataclass
+class _Slot:
+    """A cue being scheduled: when it starts (seconds into the lap) and how long it lasts."""
+
+    cue: Cue
+    t: float
+    planned: float
+    dur: float
 
 
 @dataclass
@@ -77,6 +106,8 @@ class PaceNotes:
     latency_s: float = 0.35
     apex_lead_s: float = 1.2
     max_later_than_ref_m: float = 5.0
+    gap_s: float = 0.15  # silence between two cues
+    speech_s: Callable[[str], float] = field(default=estimate_speech_s, repr=False)
 
     def __post_init__(self) -> None:
         for m in self.ref_metrics:
@@ -113,18 +144,16 @@ class PaceNotes:
         """All cue points for one lap, sorted by position."""
         out: list[Cue] = []
         ordered = sorted(self.ref_metrics, key=lambda m: m.start_m)
-        for i, m in enumerate(ordered):
+        for m in ordered:
             if only is not None and m.name not in only:
                 continue
             note = self.notes.get(m.name) or template_note(m)
-            prev_end = ordered[i - 1].end_m if i > 0 else ordered[-1].end_m - self.length_m
             mark = self.marks.get(m.name)
             anchor = mark if mark is not None else (m.turn_in_m or m.start_m)
             v = self._v(anchor)
             if note.say:
-                at = max(anchor - self.lead_s * v, prev_end + 5.0)
-                if anchor - at >= 1.5 * v:  # room to say it before the action
-                    out.append(Cue(m.name, "approach", at, note.say, False))
+                at = anchor - self.lead_s * v
+                out.append(Cue(m.name, "approach", at, note.say, False))
             if mark is not None and note.call_brake:
                 out.append(Cue(m.name, "brake", mark - self.latency_s * v, "Brake", True))
             if note.call_turn and m.turn_in_m is not None:
@@ -137,7 +166,90 @@ class PaceNotes:
                 t = m.throttle_m - self.latency_s * self._v(m.throttle_m)
                 out.append(Cue(m.name, "throttle", t, "Throttle", True))
         wrapped = [Cue(c.corner, c.kind, c.at_m % self.length_m, c.text, c.urgent) for c in out]
-        return sorted(wrapped, key=lambda c: c.at_m)
+        return self._schedule(wrapped)
+
+    # -- scheduling ------------------------------------------------------------
+    def _time(self, s_m: float) -> float:
+        return self.ref_lap.time_at(s_m % self.length_m)
+
+    def _pos(self, t: float) -> float:
+        lap = self.ref_lap
+        return float(np.interp(t % self.lap_s, lap.t, lap.s))
+
+    @property
+    def lap_s(self) -> float:
+        return float(self.ref_lap.t[-1])
+
+    def _schedule(self, cues: list[Cue]) -> list[Cue]:
+        """Move or drop cues so each finishes before the next one starts."""
+        lap = self.lap_s
+        items = [
+            _Slot(c, self._time(c.at_m), self._time(c.at_m), self.speech_s(c.text)) for c in cues
+        ]
+        gap = self.gap_s
+        for _ in range(4 * len(items) + 4):
+            items.sort(key=lambda it: it.t)
+            n = len(items)
+            if n < 2:
+                break
+            for i in range(n):
+                a, b = items[i], items[(i + 1) % n]
+                tb = b.t + (lap if i == n - 1 else 0.0)
+                overlap = a.t + a.dur + gap - tb
+                if overlap <= 1e-9:
+                    continue
+                if self._move_earlier(items, i, tb - a.dur - gap):
+                    break
+                if self._delay(items, (i + 1) % n, overlap):
+                    break
+                pa, pb = _PRIORITY[a.cue.kind], _PRIORITY[b.cue.kind]
+                items.remove(b if pb <= pa else a)
+                break
+            else:
+                break  # no overlaps left
+        out = [
+            Cue(
+                it.cue.corner,
+                it.cue.kind,
+                self._pos(it.t),
+                it.cue.text,
+                it.cue.urgent,
+            )
+            for it in items
+        ]
+        return sorted(out, key=lambda c: c.at_m)
+
+    def _move_earlier(self, items: list[_Slot], i: int, new_t: float) -> bool:
+        it = items[i]
+        limit = _MAX_ADVANCE_S.get(it.cue.kind)
+        if limit is None:
+            return False
+        n = len(items)
+        prev = items[i - 1]
+        prev_end = prev.t - (self.lap_s if i == 0 else 0.0) + prev.dur + self.gap_s
+        if new_t < it.planned - limit or new_t < prev_end:
+            return False
+        it.t = new_t % self.lap_s if n else new_t
+        return True
+
+    def _delay(self, items: list[_Slot], j: int, by: float) -> bool:
+        """Start a note slightly late (at most 0.4 s) if the cue after it allows.
+
+        A less important cue in the way (e.g. "Throttle") is dropped for it.
+        """
+        it = items[j]
+        if it.cue.kind not in _MAX_ADVANCE_S or by > 0.4:
+            return False
+        n = len(items)
+        nxt = items[(j + 1) % n]
+        t_next = nxt.t + (self.lap_s if j == n - 1 else 0.0)
+        if it.t + by + it.dur + self.gap_s > t_next:
+            if n > 2 and _PRIORITY[nxt.cue.kind] < _PRIORITY[it.cue.kind]:
+                items.remove(nxt)
+                return True  # try again without it
+            return False
+        it.t = (it.t + by) % self.lap_s
+        return True
 
     # -- persistence -----------------------------------------------------------
     def to_dict(self) -> dict[str, Any]:

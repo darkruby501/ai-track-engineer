@@ -51,6 +51,8 @@ class Speaker(Protocol):
 
     def prefetch(self, texts: Iterable[str]) -> None: ...
 
+    def seconds(self, text: str) -> float | None: ...
+
     def close(self) -> None: ...
 
 
@@ -65,6 +67,10 @@ class LogSpeaker:
         _log.info("say", text=text, urgent=urgent)
 
     def prefetch(self, texts: Iterable[str]) -> None:
+        return None
+
+    def seconds(self, text: str) -> float | None:
+        """How long *text* takes to say, if known (cue scheduling uses an estimate otherwise)."""
         return None
 
     def close(self) -> None:
@@ -221,6 +227,7 @@ class ElevenLabsSpeaker(LogSpeaker):
         self._cv = threading.Condition()
         self._busy_until = 0.0
         self._closed = False
+        self._seconds: dict[str, float] = {}
         self.failures = 0
         if start_threads:
             threading.Thread(target=self._play_loop, daemon=True).start()
@@ -269,6 +276,16 @@ class ElevenLabsSpeaker(LogSpeaker):
 
     def cached(self, text: str) -> bool:
         return self._cache_path(text).is_file()
+
+    def seconds(self, text: str) -> float | None:
+        """Length of the cached audio for *text*, or None if not generated yet."""
+        clean = " ".join(text.split())
+        if clean not in self._seconds:
+            path = self._cache_path(clean)
+            if not path.is_file():
+                return None
+            self._seconds[clean] = wav_seconds(path.read_bytes())
+        return self._seconds[clean]
 
     # -- speaking ----------------------------------------------------------------
     def say(self, text: str, *, urgent: bool = False) -> None:

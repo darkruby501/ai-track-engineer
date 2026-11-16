@@ -7,7 +7,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 from src.coach.metrics import compare, measure_lap
-from src.coach.pacenotes import CornerNote, PaceNotes, PassRecord, quick_verdict, template_note
+from src.coach.pacenotes import (
+    CornerNote,
+    PaceNotes,
+    PassRecord,
+    estimate_speech_s,
+    quick_verdict,
+    template_note,
+)
 from src.coach.target_line import (
     BRAKE,
     SIDE_L,
@@ -204,8 +211,9 @@ def test_template_notes_and_cues_are_ordered() -> None:
     cues = pace.cues()
     kinds = [c.kind for c in cues if c.corner == "Alpha"]
     # Alpha is the first corner: its approach sentence wraps to the end of the
-    # previous lap; within the lap the cue words come in driving order.
-    assert kinds == ["brake", "turn", "apex", "throttle", "approach"]
+    # previous lap; within the lap the cue words come in driving order. The
+    # apex note would run into "Throttle", so "Throttle" gives way.
+    assert kinds == ["brake", "turn", "apex", "approach"]
     assert next(c for c in cues if c.kind == "approach" and c.corner == "Alpha").at_m > 900
     assert [c.at_m for c in cues] == sorted(c.at_m for c in cues)
     brake = next(c for c in cues if c.corner == "Alpha" and c.kind == "brake")
@@ -213,6 +221,46 @@ def test_template_notes_and_cues_are_ordered() -> None:
     assert brake.at_m < pace.marks["Alpha"]
     only = pace.cues(only={"Bravo"})
     assert {c.corner for c in only} == {"Bravo"}
+
+
+def _assert_no_overlaps(pace: PaceNotes, cues: list) -> None:
+    times = [pace._time(c.at_m) for c in cues]
+    for i, c in enumerate(cues):
+        nxt = times[(i + 1) % len(cues)] + (pace.lap_s if i == len(cues) - 1 else 0.0)
+        assert times[i] + pace.speech_s(c.text) + pace.gap_s <= nxt + 1e-6, c
+
+
+def test_cues_never_cut_each_other_off() -> None:
+    pace = _pace()
+    long_note = "Brake before the left kerb, hold right, then squeeze the throttle"
+    pace.notes["Alpha"] = CornerNote(
+        "Alpha",
+        say=long_note,
+        apex_say="Late apex, smooth hands, patient",
+        call_turn=True,
+        call_throttle=True,
+    )
+    pace.notes["Bravo"] = CornerNote(
+        "Bravo", say="Bravo, third", apex_say="Kerb", call_turn=True, call_throttle=True
+    )
+    cues = pace.cues()
+    _assert_no_overlaps(pace, cues)
+    kinds = {(c.corner, c.kind) for c in cues}
+    # "Brake" and "Turn in" are never given up for a note
+    assert {("Alpha", "brake"), ("Alpha", "turn"), ("Bravo", "brake"), ("Bravo", "turn")} <= kinds
+    approach = next(c for c in cues if c.corner == "Alpha" and c.kind == "approach")
+    brake = next(c for c in cues if c.corner == "Alpha" and c.kind == "brake")
+    # the long approach note moved earlier so it ends before "Brake"
+    start, end = pace._time(approach.at_m), pace._time(brake.at_m)
+    assert (end - start) % pace.lap_s >= pace.speech_s(long_note) + pace.gap_s - 1e-6
+    # measured durations replace the estimate
+    pace.speech_s = lambda text: 0.5
+    assert len(pace.cues()) >= len(cues)
+
+
+def test_estimate_speech_s_grows_with_words() -> None:
+    short, long = estimate_speech_s("Brake"), estimate_speech_s("Brake at the kink, 2nd gear")
+    assert 0.6 < short < 1.0 < long < 3.0
 
 
 def test_marks_move_within_bounds_and_state_roundtrips(tmp_path: Path) -> None:
