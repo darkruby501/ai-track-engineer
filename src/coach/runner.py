@@ -88,6 +88,7 @@ def build_coach(
         latency_s=settings.cue_latency_s,
     )
     pace.speech_s = lambda text: speaker.seconds(text) or estimate_speech_s(text)
+    pace.cue_words = not settings.line_visible
     state_path = Path(settings.notes_dir) / f"{stem}__notes.json"
     state = PaceNotes.load_state(state_path)
     state.pop("marks", None)  # marks always come from the current target
@@ -106,6 +107,7 @@ def build_coach(
             marks=pace.marks,
             target_min_kmh=target_min,
             context_files=[Path(p) for p in settings.context_files],
+            line_visible=settings.line_visible,
         )
         head_client = head_llm or AnthropicClient(
             model=settings.model,
@@ -135,6 +137,9 @@ def build_coach(
         context=context,
         head_client=head_client,
         notes_from_claude=state.get("notes_source") == "claude",
+        verdict_min_change_s=settings.verdict_min_change_s,
+        max_verdicts_per_lap=settings.max_verdicts_per_lap,
+        feedback_voice=settings.elevenlabs_feedback_voice,
     )
     return coach
 
@@ -410,3 +415,33 @@ async def debrief(
         + "\n\n".join(p.read_text(encoding="utf-8") for p in context if p.is_file())
     )
     return await client.complete(system, debrief_message(laps, reference, events))
+
+
+def timeline(log_path: Path) -> list[str]:
+    """Where each spoken line was triggered and where it actually played (or was dropped)."""
+    rows = [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if not rows:
+        return []
+    t0 = float(rows[0]["t"])
+    pending: dict[str, dict[str, Any]] = {}
+    out: list[str] = []
+    for r in rows:
+        event = r.get("event")
+        if event in ("cue", "said"):
+            pending[r["say"]] = r
+        elif event in ("played", "dropped"):
+            trigger = pending.pop(r["say"], None)
+            what = "played " if event == "played" else "DROPPED"
+            src = ""
+            if trigger is not None:
+                kind = trigger.get("kind", "")
+                src = f"  (triggered @{trigger.get('at_m')} m, {kind})"
+            out.append(
+                f"{float(r['t']) - t0:7.1f}s {r.get('voice', ''):<6} {what} @{r.get('at_m')} m "
+                f"{r.get('kmh')} km/h after {r.get('waited_s')}s{src}: {r['say']}"
+            )
+    return out

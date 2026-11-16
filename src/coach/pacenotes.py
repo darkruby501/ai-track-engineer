@@ -87,6 +87,7 @@ class PassRecord:
     row: CornerComparison
     mark_m: float | None
     said_after: str = ""
+    incident: str = ""  # "spin or near-stop" / "off track" - not a fair comparison
 
 
 def template_note(ref: CornerMetrics) -> CornerNote:
@@ -107,6 +108,7 @@ class PaceNotes:
     apex_lead_s: float = 1.2
     max_later_than_ref_m: float = 5.0
     gap_s: float = 0.15  # silence between two cues
+    cue_words: bool = True  # "Brake" / "Turn in" / "Throttle" (off when the line shows them)
     speech_s: Callable[[str], float] = field(default=estimate_speech_s, repr=False)
 
     def __post_init__(self) -> None:
@@ -137,6 +139,22 @@ class PaceNotes:
         return self.marks[corner]
 
     # -- cues ----------------------------------------------------------------
+    def approach_text(self, corner: str) -> str:
+        """The approach note as spoken: always says which corner it is about."""
+        note = self.notes.get(corner)
+        if note is None or not note.say:
+            return ""
+        name = spoken_name(corner)
+        if note.say.lower().startswith(name.split()[0].lower()):
+            return note.say
+        return f"{name}. {note.say}"
+
+    def spoken_texts(self) -> list[str]:
+        """Everything the cues can say (to prepare the audio ahead of time)."""
+        texts = [self.approach_text(c) for c in self.notes]
+        texts += [n.apex_say for n in self.notes.values()]
+        return [t for t in texts if t]
+
     def _v(self, s_m: float) -> float:
         return max(self.ref_lap.speed_at(s_m % self.length_m), 30.0) / 3.6
 
@@ -153,16 +171,16 @@ class PaceNotes:
             v = self._v(anchor)
             if note.say:
                 at = anchor - self.lead_s * v
-                out.append(Cue(m.name, "approach", at, note.say, False))
-            if mark is not None and note.call_brake:
+                out.append(Cue(m.name, "approach", at, self.approach_text(m.name), False))
+            if mark is not None and note.call_brake and self.cue_words:
                 out.append(Cue(m.name, "brake", mark - self.latency_s * v, "Brake", True))
-            if note.call_turn and m.turn_in_m is not None:
+            if note.call_turn and m.turn_in_m is not None and self.cue_words:
                 t = m.turn_in_m - self.latency_s * self._v(m.turn_in_m)
                 out.append(Cue(m.name, "turn", t, "Turn in", True))
             if note.apex_say:
                 a = m.min_m - self.apex_lead_s * self._v(m.min_m)
                 out.append(Cue(m.name, "apex", a, note.apex_say, True))
-            if note.call_throttle and m.throttle_m is not None:
+            if note.call_throttle and m.throttle_m is not None and self.cue_words:
                 t = m.throttle_m - self.latency_s * self._v(m.throttle_m)
                 out.append(Cue(m.name, "throttle", t, "Throttle", True))
         wrapped = [Cue(c.corner, c.kind, c.at_m % self.length_m, c.text, c.urgent) for c in out]
@@ -289,23 +307,44 @@ def spoken_name(name: str) -> str:
     return name
 
 
+_NUMBER_WORDS = ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine")
+
+
+def time_words(seconds: float) -> str:
+    """A time gap as said aloud: "a tenth", "three tenths", "half a second", "1.2 seconds"."""
+    tenths = round(abs(seconds) * 10)
+    if tenths <= 1:
+        return "a tenth"
+    if tenths == 5:
+        return "half a second"
+    if tenths < 10:
+        return f"{_NUMBER_WORDS[tenths]} tenths"
+    return f"{abs(seconds):.1f} seconds"
+
+
 def quick_verdict(row: CornerComparison, previous: PassRecord | None, mark: float | None) -> str:
-    """An instant few-word verdict on a pass, or "" if there is nothing worth saying."""
-    parts: list[str] = []
+    """An instant verdict on a pass in a plain sentence, or "" if there is nothing to say."""
+    name = spoken_name(row.name)
+    change = ""
     if previous is not None:
         delta = row.driver.section_s - previous.row.driver.section_s
         if delta <= -0.05:
-            parts.append(f"better, {abs(delta):.1f} up")
+            change = f"{name} was {time_words(delta)} quicker than last time"
         elif delta >= 0.05:
-            parts.append(f"slower, {delta:.1f} down")
+            change = f"{name} was {time_words(delta)} slower than last time"
+    braking = ""
     if mark is not None and row.driver.brake_m is not None:
         miss = row.driver.brake_m - mark
         if miss < -10:
-            parts.append("braked early")
+            braking = "you braked early"
         elif miss > 10:
-            parts.append("braked past the mark")
-        elif parts:
-            parts.append("on the mark")
-    if not parts:
-        return ""
-    return f"{spoken_name(row.name)}: " + ", ".join(parts) + "."
+            braking = "you braked late"
+        elif change:
+            braking = "you braked right on the mark"
+    if change and braking:
+        return f"{change}, and {braking}."
+    if change:
+        return f"{change}."
+    if braking:
+        return f"In {name}, {braking}."
+    return ""

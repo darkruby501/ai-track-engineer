@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,8 +46,11 @@ def say_lap_time(lap_s: float, ref_s: float) -> str:
     minutes, rest = divmod(tenths_total, 600)
     whole, tenth = divmod(rest, 10)
     delta = lap_s - ref_s
-    sign = "plus" if delta >= 0 else "minus"
-    return f"{int(minutes)} {whole:02d} point {tenth}, {sign} {abs(delta):.1f}"
+    gap = "off" if delta >= 0 else "under"
+    return (
+        f"Lap time {int(minutes)} {whole:02d} point {tenth}, "
+        f"{abs(delta):.1f} seconds {gap} the reference."
+    )
 
 
 def speech_seconds(text: str) -> float:
@@ -79,6 +83,10 @@ class LiveCoach:
     context: Any = None  # CoachContext, used to write initial notes
     head_client: Any = None
     notes_from_claude: bool = False
+    verdict_min_change_s: float = 0.15
+    max_verdicts_per_lap: int = 3
+    feedback_voice: str = ""  # voice for what just happened (verdicts, lap times)
+    verdict_max_age_s: float = 6.0  # feedback not said within this long is dropped
 
     _samples: list[Sample] = field(default_factory=list)
     _ref_metrics: list[CornerMetrics] = field(default_factory=list)
@@ -91,9 +99,17 @@ class LiveCoach:
     _queue: list[_Queued] = field(default_factory=list)
     _tasks: set[asyncio.Task[None]] = field(default_factory=set)
     _laps_seen: int = 0
+    _verdicts_this_lap: int = 0
+    # Clean ("green") laps: complete, no pit lane, no spin or off. Verdicts only
+    # compare with the latest of these.
+    _lap_passes: dict[int, int] = field(default_factory=dict)
+    _lap_incidents: dict[int, list[str]] = field(default_factory=dict)
+    _green_laps: set[int] = field(default_factory=set)
     plans: list[LapPlan] = field(default_factory=list)
+    _log_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def __post_init__(self) -> None:
+        self.speaker.on_play = self._on_played
         self._ref_metrics = measure_lap(self.reference.lap, self.corners, edges=self.edges)
         self._ref_by_name = {m.name: m for m in self._ref_metrics}
 
@@ -104,10 +120,7 @@ class LiveCoach:
     # -- public API -----------------------------------------------------------
     def prefetch_notes(self) -> None:
         """Ask the speaker to prepare audio for every note (instant playback)."""
-        texts: list[str] = []
-        for note in self.pace.notes.values():
-            texts.extend(t for t in (note.say, note.apex_say) if t)
-        self.speaker.prefetch(texts)
+        self.speaker.prefetch(self.pace.spoken_texts())
 
     async def feed(self, sample: Sample) -> None:
         prev = self._samples[-1] if self._samples else None
@@ -172,12 +185,20 @@ class LiveCoach:
         self._queue = [q for q in self._queue if sample.t - q.created_t <= q.max_age_s]
         if not self._queue:
             return
+        if self.speaker.busy():
+            return  # never pile feedback up behind something still being said
         gap = self._seconds_to_next_cue(sample.pos * self.length_m, sample.speed_kmh)
         item = self._queue[0]
         if gap >= speech_seconds(item.text) + 0.3:
             self._queue.pop(0)
-            self.speaker.say(item.text)
-            self._event("said", kind=item.kind, say=item.text)
+            self._event(
+                "said",
+                kind=item.kind,
+                say=item.text,
+                at_m=round(sample.pos * self.length_m),
+                waited_s=round(sample.t - item.created_t, 2),
+            )
+            self.speaker.say(item.text, voice=self.feedback_voice)
 
     # -- per-corner passes --------------------------------------------------------
     def _lap_no(self) -> int:
@@ -222,10 +243,20 @@ class LiveCoach:
             apex_inside_m=d.apex_inside_m,
             exit_outside_m=d.exit_outside_m,
         )
-        quick = quick_verdict(row, history[-1] if history else None, mark)
+        record.incident = self.incident(row)
+        self._lap_passes[record.lap] = self._lap_passes.get(record.lap, 0) + 1
+        if record.incident:
+            self._lap_incidents.setdefault(record.lap, []).append(f"{record.incident} at {name}")
+            self._event("incident", corner=name, lap=record.lap, what=record.incident)
+            history.append(record)
+            return  # no verdict or note change from a spin or an off
+        clean = self.clean_history(name)
+        previous = clean[-1] if clean else None
+        quick = quick_verdict(row, previous, mark)
+        if not self._verdict_due(row, previous):
+            quick = ""
         if self.advisor is None:
-            self._queue_say(quick, t, max_age_s=10.0, kind="verdict")
-            record.said_after = quick
+            self._say_verdict(quick, record, t, max_age_s=self.verdict_max_age_s)
             history.append(record)
             return
         message = pass_message(
@@ -233,14 +264,51 @@ class LiveCoach:
             lap=record.lap,
             mark=mark,
             target_min=self.target_min_kmh.get(name),
-            history=history,
+            history=clean,
             note=self.pace.notes[name],
         )
         history.append(record)
-        self._spawn(self._advise(name, message, quick, record, t))
+        self._spawn(self._advise(name, message, quick, record, t, speak=bool(quick)))
+
+    def incident(self, row: CornerComparison) -> str:
+        """Why this pass is not a fair comparison (a spin, a stop, an off), or ""."""
+        d = row.driver
+        if d.min_kmh < max(25.0, 0.6 * row.ref.min_kmh):
+            return "spin or near-stop"
+        gaps = [g for g in (d.apex_inside_m, d.exit_outside_m) if g is not None]
+        if any(g < -0.5 for g in gaps):
+            return "off track"
+        return ""
+
+    def clean_history(self, corner: str) -> list[PassRecord]:
+        """Passes through *corner* on clean (green) laps, oldest first."""
+        return [
+            r for r in self._history.get(corner, []) if r.lap in self._green_laps and not r.incident
+        ]
+
+    def _verdict_due(self, row: CornerComparison, previous: PassRecord | None) -> bool:
+        """Speak a verdict only when this pass clearly differs from the last one."""
+        if previous is None or self._verdicts_this_lap >= self.max_verdicts_per_lap:
+            return False
+        change = row.driver.section_s - previous.row.driver.section_s
+        return abs(change) >= self.verdict_min_change_s
+
+    def _say_verdict(self, text: str, record: PassRecord, t: float, *, max_age_s: float) -> None:
+        if not text:
+            return
+        self._verdicts_this_lap += 1
+        record.said_after = text
+        self._queue_say(text, t, max_age_s=max_age_s, kind="verdict")
 
     async def _advise(
-        self, name: str, message: str, quick: str, record: PassRecord, t: float
+        self,
+        name: str,
+        message: str,
+        quick: str,
+        record: PassRecord,
+        t: float,
+        *,
+        speak: bool = True,
     ) -> None:
         assert self.advisor is not None
         started = time.monotonic()
@@ -250,16 +318,17 @@ class LiveCoach:
             )
         except Exception as exc:  # noqa: BLE001 - coaching must never stop the session
             _log.warning("advisor-failed", corner=name, error=repr(exc))
-            self._queue_say(quick, t, max_age_s=10.0, kind="verdict")
-            record.said_after = quick
+            self._say_verdict(quick, record, t, max_age_s=self.verdict_max_age_s)
             return
         advice.note.objective = self.pace.notes[name].objective
         self.pace.notes[name] = advice.note
-        self.speaker.prefetch([t for t in (advice.note.say, advice.note.apex_say) if t])
+        self.speaker.prefetch(
+            [t for t in (self.pace.approach_text(name), advice.note.apex_say) if t]
+        )
         self._cues_dirty = True
         now = quick if advice.rejected else advice.now
-        record.said_after = now
-        self._queue_say(now, t, max_age_s=12.0, kind="verdict")
+        if speak:
+            self._say_verdict(now, record, t, max_age_s=self.verdict_max_age_s)
         self._save_state()
         self._event(
             "advice",
@@ -275,6 +344,7 @@ class LiveCoach:
     # -- laps ---------------------------------------------------------------------
     def _on_lap_complete(self, samples: list[Sample], lap_ms: int, t: float) -> None:
         self._laps_seen += 1
+        self._verdicts_this_lap = 0
         lap_no = samples[-1].lap + 1
         if lap_ms <= 0 or len(samples) < 50:
             return
@@ -285,6 +355,10 @@ class LiveCoach:
         pit = any(s.in_pit for s in samples)
         if pit:
             flags.append("lap included the pit lane (out-lap or in-lap)")
+        incidents = self._lap_incidents.get(lap_no, [])
+        flags += incidents
+        if not pit and not incidents and self._lap_passes.get(lap_no, 0) == len(self.corners):
+            self._green_laps.add(lap_no)
         if self._laps_seen == 1:
             flags.append("first lap seen this session (may be partial or an out-lap)")
         if lap_s > ref_s + 8:
@@ -298,6 +372,7 @@ class LiveCoach:
             "lap",
             lap=lap_no,
             time_s=lap_s,
+            green=lap_no in self._green_laps,
             flags=flags,
             corners=[{"corner": r.name, "lost_s": round(r.time_lost_s, 3)} for r in rows],
         )
@@ -364,10 +439,23 @@ class LiveCoach:
     def finish(self) -> None:
         self._event("session-usage", summary=self.usage_summary())
 
+    def _on_played(self, text: str, voice: str, waited_s: float, played: bool) -> None:
+        """From the speaker (any thread): where the car was when a phrase started."""
+        last = self._samples[-1] if self._samples else None
+        self._event(
+            "played" if played else "dropped",
+            say=text,
+            voice=voice or "main",
+            waited_s=round(waited_s, 2),
+            at_m=None if last is None else round(last.pos * self.length_m),
+            kmh=None if last is None else round(last.speed_kmh),
+        )
+
     def _event(self, event_name: str, /, **data: Any) -> None:
         _log.info(event_name, **data)
         if self.log_path is not None:
-            self.log_path.parent.mkdir(parents=True, exist_ok=True)
-            with self.log_path.open("a", encoding="utf-8") as fh:
-                record = {"t": round(time.time(), 2), "event": event_name, **data}
-                fh.write(json.dumps(record) + "\n")
+            with self._log_lock:
+                self.log_path.parent.mkdir(parents=True, exist_ok=True)
+                with self.log_path.open("a", encoding="utf-8") as fh:
+                    record = {"t": round(time.time(), 2), "event": event_name, **data}
+                    fh.write(json.dumps(record) + "\n")

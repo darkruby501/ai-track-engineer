@@ -75,6 +75,13 @@ class CoachSettings(BaseModel):
     pace_notes: bool = True
     pace_lead_s: float = 3.5  # approach sentence starts this long before the mark
     cue_latency_s: float = 0.35  # say cue words this early to absorb TTS delay
+    # The AC ideal line (coloured by pedal) already shows where to brake, turn in
+    # and get on the throttle; with it visible, those cue words are not spoken.
+    line_visible: bool = True
+    # Corner verdicts: only when the pass changed this much from the last pass
+    # through that corner, and at most this many per lap.
+    verdict_min_change_s: float = 0.15
+    max_verdicts_per_lap: int = 3
     fast_model: str = "claude-haiku-5-5"  # per-corner verdicts and note updates
     # Voice: "auto" uses ElevenLabs when ELEVENLABS_API_KEY is set, else the
     # system voice; "system" forces the system voice.
@@ -82,6 +89,9 @@ class CoachSettings(BaseModel):
     elevenlabs_voice: str = ""  # voice name or id; "" = first of Brian/Adam/George/...
     elevenlabs_model: str = "eleven_flash_v2_5"
     elevenlabs_speed: float = 1.1
+    # A second voice for feedback on what just happened (corner verdicts, lap
+    # times, lap comments); the main voice says what is coming up.
+    elevenlabs_feedback_voice: str = "Eric"
     tts_cache_dir: str = "data/local/tts_cache"
 
 

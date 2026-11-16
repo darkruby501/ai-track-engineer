@@ -94,10 +94,12 @@ def make_lap(
 
 
 def make_session(n_laps: int, **kwargs: Any) -> list[Sample]:
+    """*n_laps* laps; a list value gives that parameter per lap (e.g. brake_a=[100, 150])."""
     out: list[Sample] = []
     t, last_ms = 0.0, 0
     for lap in range(n_laps):
-        samples, duration = make_lap(lap, t0=t, last_ms=last_ms, **kwargs)
+        per_lap = {k: (v[lap] if isinstance(v, list) else v) for k, v in kwargs.items()}
+        samples, duration = make_lap(lap, t0=t, last_ms=last_ms, **per_lap)
         out.extend(samples)
         t += duration
         last_ms = int(duration * 1000)
@@ -173,9 +175,9 @@ def test_split_laps_and_best_lap() -> None:
 
 # -- spoken text and heuristics -------------------------------------------------
 def test_say_lap_time_rounds_into_the_next_second() -> None:
-    assert say_lap_time(139.969, 139.382) == "2 20 point 0, plus 0.6"
-    assert say_lap_time(139.382, 139.382) == "2 19 point 4, plus 0.0"
-    assert say_lap_time(138.0, 139.382) == "2 18 point 0, minus 1.4"
+    assert say_lap_time(139.969, 139.382) == "Lap time 2 20 point 0, 0.6 seconds off the reference."
+    assert say_lap_time(139.382, 139.382) == "Lap time 2 19 point 4, 0.0 seconds off the reference."
+    assert say_lap_time(138.0, 139.382) == "Lap time 2 18 point 0, 1.4 seconds under the reference."
 
 
 class _FakeMessages:
@@ -368,7 +370,7 @@ async def test_live_coach_cues_verdicts_and_focus(tmp_path: Path) -> None:
     log = tmp_path / "log.jsonl"
     fast, head = FakeJSON(ADVICE), FakeJSON(PLAN)
     coach = _coach(advisor=fast, head=head, log=log)
-    await _drive(coach, make_session(3, brake_a=120.0))
+    await _drive(coach, make_session(3, brake_a=[100.0, 150.0, 150.0]))
     spoken = coach.speaker.spoken
     assert "Brake" in spoken
     assert any(s.startswith("Alpha") for s in spoken)  # approach note
@@ -387,17 +389,115 @@ async def test_live_coach_cues_verdicts_and_focus(tmp_path: Path) -> None:
 
 async def test_live_coach_without_models_uses_quick_verdicts() -> None:
     coach = _coach()
-    await _drive(coach, make_session(3, brake_a=100.0))
+    await _drive(coach, make_session(3, brake_a=[150.0, 100.0, 100.0]))
     assert any("braked early" in s for s in coach.speaker.spoken)
+    assert (
+        coach.speaker.spoken.count(
+            "Alpha was four tenths slower than last time, and you braked early."
+        )
+        == 1
+    )
 
 
 async def test_advisor_failure_falls_back_and_keeps_notes() -> None:
     coach = _coach(advisor=FakeJSON(RuntimeError("down")), head=FakeJSON(RuntimeError("down")))
     before = coach.pace.notes["Alpha"].say
-    await _drive(coach, make_session(2, brake_a=100.0))
+    await _drive(coach, make_session(2, brake_a=[150.0, 100.0]))
     assert coach.pace.notes["Alpha"].say == before
     assert any("braked early" in s for s in coach.speaker.spoken)
     assert coach.plans == []
+
+
+async def test_verdicts_compare_with_clean_laps_only() -> None:
+    coach = _coach()
+    # lap 1 clean; lap 2 nearly stops in Alpha (a spin); lap 3 brakes early
+    await _drive(coach, make_session(3, brake_a=[150.0, 150.0, 100.0], min_a=[80.0, 10.0, 80.0]))
+    alpha = coach._history["Alpha"]
+    assert [r.incident for r in alpha] == ["", "spin or near-stop", ""]
+    assert coach._green_laps == {1, 3}
+    # no verdict for the spin; lap 3 is compared with lap 1, not the spun lap 2
+    spoken = coach.speaker.spoken
+    assert not any("quicker" in s for s in spoken)
+    assert any(s.startswith("Alpha was") and "slower" in s for s in spoken)
+
+
+async def test_verdicts_need_a_clear_change_and_are_capped() -> None:
+    coach = _coach()
+    coach.max_verdicts_per_lap = 1
+    await _drive(
+        coach, make_session(3, brake_a=[150.0, 100.0, 100.0], brake_b=[560.0, 500.0, 500.0])
+    )
+    verdicts = [s for s in coach.speaker.spoken if "than last time" in s]
+    assert len(verdicts) == 1  # one per lap at most, and lap 3 repeats lap 2 (no change)
+
+
+def test_elevenlabs_drops_stale_feedback_and_reports_playback(tmp_path: Path) -> None:
+    speaker, _, player, _ = _eleven(tmp_path)
+    events: list[tuple[str, bool]] = []
+    speaker.on_play = lambda text, voice, waited, played: events.append((text, played))
+    speaker.say("Sunrise was a tenth quicker.")
+    assert speaker.busy()
+    speaker.max_wait_s = -1.0  # everything non-urgent is now "too old"
+    assert speaker.play_next() and events == [("Sunrise was a tenth quicker.", False)]
+    assert not player.played
+    speaker.say("Brake", urgent=True)  # cues are never dropped
+    assert speaker.play_next() and events[-1] == ("Brake", True)
+
+
+async def test_timeline_shows_trigger_and_play_positions(tmp_path: Path) -> None:
+    from src.coach.runner import timeline
+
+    log = tmp_path / "log.jsonl"
+    coach = _coach(log=log)
+    await _drive(coach, make_session(2, brake_a=[150.0, 100.0]))
+    lines = timeline(log)
+    assert any("played" in line and "(triggered @" in line and "approach" in line for line in lines)
+    assert any("slower than last time" in line and "verdict" in line for line in lines)
+
+
+async def test_feedback_waits_until_the_voice_is_free() -> None:
+    coach = _coach()
+    coach.speaker.busy = lambda: True  # type: ignore[method-assign]
+    await _drive(coach, make_session(2, brake_a=[150.0, 100.0]))
+    assert not any("than last time" in s for s in coach.speaker.spoken)
+
+
+async def test_feedback_uses_the_second_voice() -> None:
+    coach = _coach()
+    coach.feedback_voice = "Eric"
+    said: list[tuple[str, str]] = []
+    original = coach.speaker.say
+
+    def spy(text: str, *, urgent: bool = False, voice: str = "") -> None:
+        said.append((text, voice))
+        original(text, urgent=urgent, voice=voice)
+
+    coach.speaker.say = spy  # type: ignore[method-assign]
+    await _drive(coach, make_session(2, brake_a=[150.0, 100.0]))
+    assert any("point" in text and voice == "Eric" for text, voice in said)  # lap time
+    assert any("slower" in text and voice == "Eric" for text, voice in said)  # verdict
+    assert all(voice == "" for text, voice in said if text == "Brake")  # cues: main voice
+
+
+def test_approach_notes_name_the_corner() -> None:
+    ref = reference()
+    pace = PaceNotes(ref_metrics=measure_lap(ref.lap, CORNERS), ref_lap=ref.lap)
+    pace.notes["Alpha"].say = "Brake at the bridge, third gear"
+    assert pace.approach_text("Alpha") == "Alpha. Brake at the bridge, third gear"
+    pace.notes["Bravo"].say = "Bravo, third."  # already named
+    assert pace.approach_text("Bravo") == "Bravo, third."
+    assert "Alpha. Brake at the bridge, third gear" in pace.spoken_texts()
+    assert any(c.text.startswith("Alpha. ") for c in pace.cues() if c.kind == "approach")
+
+
+def test_no_cue_words_when_the_line_is_visible() -> None:
+    ref = reference()
+    pace = PaceNotes(ref_metrics=measure_lap(ref.lap, CORNERS), ref_lap=ref.lap, cue_words=False)
+    pace.notes["Alpha"].call_turn = pace.notes["Alpha"].call_throttle = True
+    assert {c.kind for c in pace.cues()} <= {"approach", "apex"}
+    ctx = _context()
+    ctx.line_visible = True
+    assert "ideal line" in ctx.text() and "Never repeat what the line shows" in ctx.text()
 
 
 async def test_pit_laps_get_no_head_plan() -> None:
@@ -493,7 +593,7 @@ def test_build_coach_uses_target_marks(tmp_path: Path) -> None:
 
 
 async def test_replay_and_debrief_message(tmp_path: Path) -> None:
-    csv_path = _write_csv(tmp_path / "session.csv", make_session(3, brake_a=120.0))
+    csv_path = _write_csv(tmp_path / "session.csv", make_session(3, brake_a=[100.0, 150.0, 120.0]))
     settings = CoachSettings(context_files=[], notes_dir=str(tmp_path))
     fast = FakeJSON(ADVICE)
     coach = build_coach(
@@ -641,6 +741,10 @@ def test_elevenlabs_caches_audio_and_picks_a_voice(tmp_path: Path) -> None:
     assert speaker.cached("Brake") and not speaker.cached("Throttle")
     assert speaker.seconds(" Brake ") == pytest.approx(0.1)
     assert speaker.seconds("Throttle") is None and LogSpeaker().seconds("Brake") is None
+    # a second voice: its own id, its own cache entry
+    speaker.say("Brake", voice="Rachel", urgent=True)
+    assert speaker.play_next() and "/text-to-speech/r1?" in posts[-1]["url"]
+    assert speaker.cached("Brake", "Rachel") and speaker.seconds("Brake", voice="Rachel")
 
 
 def test_elevenlabs_urgent_interrupts_and_queues(tmp_path: Path) -> None:

@@ -229,6 +229,19 @@ def coach_target_line(
     typer.echo(f"wrote {out_dir / (stem + '__target.json')} and {stem}__ideal_line.ai")
 
 
+@coach_app.command("timeline")
+def coach_timeline(
+    log_path: Annotated[Path, typer.Argument(help="Session .jsonl written by `coach run`.")],
+    last: int = typer.Option(0, help="Only the last N lines (0 = all)."),
+) -> None:
+    """Where each spoken line was triggered and where it actually played."""
+    from src.coach.runner import timeline
+
+    lines = timeline(log_path)
+    for line in lines[-last:] if last else lines:
+        typer.echo(line)
+
+
 @coach_app.command("debrief")
 def coach_debrief(
     csv_path: Annotated[Path, typer.Argument(help="Session CSV written by `coach run`.")],

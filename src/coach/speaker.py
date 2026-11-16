@@ -47,13 +47,20 @@ CUE_WORDS = ("Brake", "Turn in", "Throttle", "Coach ready.")
 
 
 class Speaker(Protocol):
-    def say(self, text: str, *, urgent: bool = False) -> None: ...
+    def say(self, text: str, *, urgent: bool = False, voice: str = "") -> None: ...
 
-    def prefetch(self, texts: Iterable[str]) -> None: ...
+    def prefetch(self, texts: Iterable[str], *, voice: str = "") -> None: ...
 
-    def seconds(self, text: str) -> float | None: ...
+    def seconds(self, text: str, *, voice: str = "") -> float | None: ...
+
+    def busy(self) -> bool: ...
 
     def close(self) -> None: ...
+
+
+# Called when a phrase starts playing (played=True) or is dropped as stale:
+# (text, voice, seconds it waited, played).
+OnPlay = Callable[[str, str, float, bool], None]
 
 
 class LogSpeaker:
@@ -61,15 +68,22 @@ class LogSpeaker:
 
     def __init__(self) -> None:
         self.spoken: list[str] = []
+        self.on_play: OnPlay | None = None
 
-    def say(self, text: str, *, urgent: bool = False) -> None:
+    def say(self, text: str, *, urgent: bool = False, voice: str = "") -> None:
         self.spoken.append(text)
-        _log.info("say", text=text, urgent=urgent)
+        _log.info("say", text=text, urgent=urgent, voice=voice or None)
+        if self.on_play is not None and type(self) is not ElevenLabsSpeaker:
+            self.on_play(text, voice, 0.0, True)  # plays at once (as far as we know)
 
-    def prefetch(self, texts: Iterable[str]) -> None:
+    def busy(self) -> bool:
+        """Still talking or has phrases waiting (the coach holds feedback until not)."""
+        return False
+
+    def prefetch(self, texts: Iterable[str], *, voice: str = "") -> None:
         return None
 
-    def seconds(self, text: str) -> float | None:
+    def seconds(self, text: str, *, voice: str = "") -> float | None:
         """How long *text* takes to say, if known (cue scheduling uses an estimate otherwise)."""
         return None
 
@@ -93,8 +107,8 @@ class WindowsSpeaker(LogSpeaker):  # pragma: no cover - needs Windows SAPI
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
 
-    def say(self, text: str, *, urgent: bool = False) -> None:
-        super().say(text, urgent=urgent)
+    def say(self, text: str, *, urgent: bool = False, voice: str = "") -> None:
+        super().say(text, urgent=urgent, voice=voice)
         if self._proc.stdin is None or self._proc.poll() is not None:
             return
         clean = " ".join(text.split())
@@ -108,8 +122,8 @@ class WindowsSpeaker(LogSpeaker):  # pragma: no cover - needs Windows SAPI
 
 
 class MacSpeaker(LogSpeaker):  # pragma: no cover - local testing only
-    def say(self, text: str, *, urgent: bool = False) -> None:
-        super().say(text, urgent=urgent)
+    def say(self, text: str, *, urgent: bool = False, voice: str = "") -> None:
+        super().say(text, urgent=urgent, voice=voice)
         subprocess.Popen(["say", "-r", "210", text])
 
 
@@ -213,7 +227,7 @@ class ElevenLabsSpeaker(LogSpeaker):
         super().__init__()
         self._headers = {"xi-api-key": api_key}
         self._voice_pref = voice
-        self._voice_id: str | None = voice if len(voice) >= 20 else None
+        self._voice_ids: dict[str, str] = {}
         self._model = model
         self._speed = speed
         self._cache = cache_dir
@@ -222,8 +236,9 @@ class ElevenLabsSpeaker(LogSpeaker):
         self._player = player or (WinsoundPlayer() if sys.platform == "win32" else AfplayPlayer())
         self._post = http_post or _httpx_post
         self._get = http_get or _httpx_get
-        self._queue: deque[str] = deque()
-        self._prefetch_queue: deque[str] = deque()
+        self._queue: deque[tuple[str, str, float, bool]] = deque()  # text, voice, t, urgent
+        self.max_wait_s = 3.0  # feedback waiting longer than this is dropped, not played late
+        self._prefetch_queue: deque[tuple[str, str]] = deque()
         self._cv = threading.Condition()
         self._busy_until = 0.0
         self._closed = False
@@ -234,10 +249,15 @@ class ElevenLabsSpeaker(LogSpeaker):
             threading.Thread(target=self._prefetch_loop, daemon=True).start()
 
     # -- voice and audio -------------------------------------------------------
-    def voice_id(self) -> str:
-        if self._voice_id is None:
+    def voice_id(self, voice: str = "") -> str:
+        """ElevenLabs id for *voice* (a name or an id; "" = this speaker's main voice)."""
+        pref = voice or self._voice_pref
+        if pref not in self._voice_ids:
+            if len(pref) >= 20:
+                self._voice_ids[pref] = pref
+                return pref
             voices = self._get(f"{self.API}/voices", self._headers).get("voices", [])
-            wanted = [self._voice_pref] if self._voice_pref else list(PREFERRED_VOICES)
+            wanted = [pref] if pref else list(PREFERRED_VOICES)
             chosen = next(
                 (
                     v
@@ -249,20 +269,20 @@ class ElevenLabsSpeaker(LogSpeaker):
             )
             if chosen is None:
                 raise RuntimeError("no ElevenLabs voices available on this account")
-            self._voice_id = str(chosen["voice_id"])
-            _log.info("elevenlabs-voice", name=chosen.get("name"), voice_id=self._voice_id)
-        return self._voice_id
+            self._voice_ids[pref] = str(chosen["voice_id"])
+            _log.info("elevenlabs-voice", name=chosen.get("name"), voice_id=self._voice_ids[pref])
+        return self._voice_ids[pref]
 
-    def _cache_path(self, text: str) -> Path:
-        key = f"{self._voice_pref}|{self._model}|{self._speed}|{text}"
+    def _cache_path(self, text: str, voice: str = "") -> Path:
+        key = f"{voice or self._voice_pref}|{self._model}|{self._speed}|{text}"
         return self._cache / (hashlib.sha1(key.encode()).hexdigest()[:20] + ".wav")
 
-    def audio(self, text: str) -> Path:
+    def audio(self, text: str, voice: str = "") -> Path:
         """Path to a WAV of *text*, synthesising (and caching) it if needed."""
-        path = self._cache_path(text)
+        path = self._cache_path(text, voice)
         if path.is_file():
             return path
-        url = f"{self.API}/text-to-speech/{self.voice_id()}?output_format=pcm_{PCM_RATE}"
+        url = f"{self.API}/text-to-speech/{self.voice_id(voice)}?output_format=pcm_{PCM_RATE}"
         body = {
             "text": text,
             "model_id": self._model,
@@ -274,41 +294,47 @@ class ElevenLabsSpeaker(LogSpeaker):
         os.replace(tmp, path)
         return path
 
-    def cached(self, text: str) -> bool:
-        return self._cache_path(text).is_file()
+    def cached(self, text: str, voice: str = "") -> bool:
+        return self._cache_path(text, voice).is_file()
 
-    def seconds(self, text: str) -> float | None:
+    def seconds(self, text: str, *, voice: str = "") -> float | None:
         """Length of the cached audio for *text*, or None if not generated yet."""
         clean = " ".join(text.split())
-        if clean not in self._seconds:
-            path = self._cache_path(clean)
+        key = f"{voice}|{clean}"
+        if key not in self._seconds:
+            path = self._cache_path(clean, voice)
             if not path.is_file():
                 return None
-            self._seconds[clean] = wav_seconds(path.read_bytes())
-        return self._seconds[clean]
+            self._seconds[key] = wav_seconds(path.read_bytes())
+        return self._seconds[key]
 
     # -- speaking ----------------------------------------------------------------
-    def say(self, text: str, *, urgent: bool = False) -> None:
-        super().say(text, urgent=urgent)
+    def say(self, text: str, *, urgent: bool = False, voice: str = "") -> None:
+        super().say(text, urgent=urgent, voice=voice)
         clean = " ".join(text.split())
         if not clean:
             return
         with self._cv:
+            item = (clean, voice, time.monotonic(), urgent)
             if urgent:
                 self._queue.clear()
                 self._player.stop()
                 self._busy_until = 0.0
-                self._queue.appendleft(clean)
+                self._queue.appendleft(item)
             else:
-                self._queue.append(clean)
+                self._queue.append(item)
             self._cv.notify_all()
 
-    def prefetch(self, texts: Iterable[str]) -> None:
+    def busy(self) -> bool:
+        with self._cv:
+            return bool(self._queue) or time.monotonic() < self._busy_until
+
+    def prefetch(self, texts: Iterable[str], *, voice: str = "") -> None:
         with self._cv:
             for t in texts:
-                clean = " ".join(t.split())
-                if clean and not self.cached(clean) and clean not in self._prefetch_queue:
-                    self._prefetch_queue.append(clean)
+                item = (" ".join(t.split()), voice)
+                if item[0] and not self.cached(*item) and item not in self._prefetch_queue:
+                    self._prefetch_queue.append(item)
             self._cv.notify_all()
 
     def play_next(self) -> bool:
@@ -316,13 +342,21 @@ class ElevenLabsSpeaker(LogSpeaker):
         with self._cv:
             if not self._queue or time.monotonic() < self._busy_until:
                 return False
-            text = self._queue.popleft()
+            text, voice, queued, urgent = self._queue.popleft()
+        waited = time.monotonic() - queued
+        if not urgent and waited > self.max_wait_s:
+            _log.info("speech-dropped-stale", text=text, waited_s=round(waited, 2))
+            if self.on_play is not None:
+                self.on_play(text, voice, waited, False)
+            return True
         try:
-            path = self.audio(text)
+            path = self.audio(text, voice)
             seconds = wav_seconds(path.read_bytes())
             self._player.play(path)
             with self._cv:
                 self._busy_until = time.monotonic() + seconds
+            if self.on_play is not None:
+                self.on_play(text, voice, time.monotonic() - queued, True)
         except Exception as exc:  # noqa: BLE001 - never lose a cue: use the system voice
             self.failures += 1
             _log.warning("elevenlabs-failed", text=text, error=repr(exc))
@@ -340,9 +374,9 @@ class ElevenLabsSpeaker(LogSpeaker):
         with self._cv:
             if not self._prefetch_queue:
                 return False
-            text = self._prefetch_queue.popleft()
+            text, voice = self._prefetch_queue.popleft()
         try:
-            self.audio(text)
+            self.audio(text, voice)
         except Exception as exc:  # noqa: BLE001
             self.failures += 1
             _log.warning("elevenlabs-prefetch-failed", text=text, error=repr(exc))

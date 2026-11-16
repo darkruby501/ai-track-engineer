@@ -14,6 +14,7 @@ from src.coach.pacenotes import (
     estimate_speech_s,
     quick_verdict,
     template_note,
+    time_words,
 )
 from src.coach.target_line import (
     BRAKE,
@@ -290,10 +291,17 @@ def test_quick_verdict() -> None:
     )[0]
     best = compare(ref_metrics, ref_metrics)[0]
     mark = 150.0
-    assert quick_verdict(slow, None, mark) == "Alpha: braked early."
+    assert quick_verdict(slow, None, mark) == "In Alpha, you braked early."
     previous = PassRecord(lap=1, row=slow, mark_m=mark)
     verdict = quick_verdict(best, previous, mark)
-    assert verdict.startswith("Alpha: better") and "on the mark" in verdict
+    assert verdict.startswith("Alpha was") and "quicker than last time" in verdict
+    assert verdict.endswith("and you braked right on the mark.")
+    assert [time_words(x) for x in (0.08, -0.3, 0.5, 1.24)] == [
+        "a tenth",
+        "three tenths",
+        "half a second",
+        "1.2 seconds",
+    ]
     assert quick_verdict(best, PassRecord(1, best, None), None) == ""
     from src.coach.pacenotes import spoken_name
 
