@@ -107,7 +107,9 @@ class PaceNotes:
     latency_s: float = 0.35
     apex_lead_s: float = 1.2
     max_later_than_ref_m: float = 5.0
-    gap_s: float = 0.15  # silence between two cues
+    gap_s: float = 0.15  # silence between two cues about the same corner
+    corner_gap_s: float = 1.5  # silence between lines about different corners
+    finish_before_s: float = 1.0  # an approach note ends this long before its corner
     cue_words: bool = True  # "Brake" / "Turn in" / "Throttle" (off when the line shows them)
     speech_s: Callable[[str], float] = field(default=estimate_speech_s, repr=False)
 
@@ -170,8 +172,10 @@ class PaceNotes:
             anchor = mark if mark is not None else (m.turn_in_m or m.start_m)
             v = self._v(anchor)
             if note.say:
-                at = anchor - self.lead_s * v
-                out.append(Cue(m.name, "approach", at, self.approach_text(m.name), False))
+                text = self.approach_text(m.name)
+                lead = max(self.lead_s, self.speech_s(text) + self.finish_before_s)
+                at = anchor - lead * v
+                out.append(Cue(m.name, "approach", at, text, False))
             if mark is not None and note.call_brake and self.cue_words:
                 out.append(Cue(m.name, "brake", mark - self.latency_s * v, "Brake", True))
             if note.call_turn and m.turn_in_m is not None and self.cue_words:
@@ -204,7 +208,6 @@ class PaceNotes:
         items = [
             _Slot(c, self._time(c.at_m), self._time(c.at_m), self.speech_s(c.text)) for c in cues
         ]
-        gap = self.gap_s
         for _ in range(4 * len(items) + 4):
             items.sort(key=lambda it: it.t)
             n = len(items)
@@ -213,6 +216,7 @@ class PaceNotes:
             for i in range(n):
                 a, b = items[i], items[(i + 1) % n]
                 tb = b.t + (lap if i == n - 1 else 0.0)
+                gap = self._gap(a, b)
                 overlap = a.t + a.dur + gap - tb
                 if overlap <= 1e-9:
                     continue
@@ -237,6 +241,10 @@ class PaceNotes:
         ]
         return sorted(out, key=lambda c: c.at_m)
 
+    def _gap(self, a: _Slot, b: _Slot) -> float:
+        """Silence needed between *a* and the following *b*."""
+        return self.gap_s if a.cue.corner == b.cue.corner else self.corner_gap_s
+
     def _move_earlier(self, items: list[_Slot], i: int, new_t: float) -> bool:
         it = items[i]
         limit = _MAX_ADVANCE_S.get(it.cue.kind)
@@ -244,7 +252,7 @@ class PaceNotes:
             return False
         n = len(items)
         prev = items[i - 1]
-        prev_end = prev.t - (self.lap_s if i == 0 else 0.0) + prev.dur + self.gap_s
+        prev_end = prev.t - (self.lap_s if i == 0 else 0.0) + prev.dur + self._gap(prev, it)
         if new_t < it.planned - limit or new_t < prev_end:
             return False
         it.t = new_t % self.lap_s if n else new_t
@@ -261,7 +269,7 @@ class PaceNotes:
         n = len(items)
         nxt = items[(j + 1) % n]
         t_next = nxt.t + (self.lap_s if j == n - 1 else 0.0)
-        if it.t + by + it.dur + self.gap_s > t_next:
+        if it.t + by + it.dur + self._gap(it, nxt) > t_next:
             if n > 2 and _PRIORITY[nxt.cue.kind] < _PRIORITY[it.cue.kind]:
                 items.remove(nxt)
                 return True  # try again without it

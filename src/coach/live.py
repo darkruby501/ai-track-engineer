@@ -134,6 +134,7 @@ class LiveCoach:
             self._samples = [sample]
             self._fired.clear()
             self._measured.clear()
+            self._cues_dirty = True  # re-plan with the audio lengths now known
             self._on_lap_complete(finished, sample.last_ms, sample.t)
             return
         self._samples.append(sample)
