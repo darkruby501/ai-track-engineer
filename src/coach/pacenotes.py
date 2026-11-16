@@ -311,7 +311,11 @@ _NUMBER_WORDS = ("zero", "one", "two", "three", "four", "five", "six", "seven", 
 
 
 def time_words(seconds: float) -> str:
-    """A time gap as said aloud: "a tenth", "three tenths", "half a second", "1.2 seconds"."""
+    """A time gap as a person would say it, never more precise than useful.
+
+    "a tenth", "three tenths", "half a second", "a second", "a second and a
+    half", "about four seconds", "about 25 seconds".
+    """
     tenths = round(abs(seconds) * 10)
     if tenths <= 1:
         return "a tenth"
@@ -319,7 +323,12 @@ def time_words(seconds: float) -> str:
         return "half a second"
     if tenths < 10:
         return f"{_NUMBER_WORDS[tenths]} tenths"
-    return f"{abs(seconds):.1f} seconds"
+    if tenths < 15:
+        return "a second"
+    if tenths < 20:
+        return "a second and a half"
+    whole = round(abs(seconds))
+    return f"about {_NUMBER_WORDS[whole] if whole < 10 else whole} seconds"
 
 
 def quick_verdict(row: CornerComparison, previous: PassRecord | None, mark: float | None) -> str:

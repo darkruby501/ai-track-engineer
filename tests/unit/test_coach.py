@@ -175,9 +175,11 @@ def test_split_laps_and_best_lap() -> None:
 
 # -- spoken text and heuristics -------------------------------------------------
 def test_say_lap_time_rounds_into_the_next_second() -> None:
-    assert say_lap_time(139.969, 139.382) == "Lap time 2 20 point 0, 0.6 seconds off the reference."
-    assert say_lap_time(139.382, 139.382) == "Lap time 2 19 point 4, 0.0 seconds off the reference."
-    assert say_lap_time(138.0, 139.382) == "Lap time 2 18 point 0, 1.4 seconds under the reference."
+    assert say_lap_time(139.969, None) == "Lap time 2 20 point 0."
+    assert say_lap_time(139.969, 139.382) == "Lap time 2 20 point 0, six tenths off your best."
+    assert say_lap_time(139.382, 139.382) == "Lap time 2 19 point 4, matching your best."
+    assert say_lap_time(138.0, 139.382) == "Lap time 2 18 point 0, a new best by a second."
+    assert say_lap_time(283.1, 139.4) == "Lap time 4 43 point 1, about 144 seconds off your best."
 
 
 class _FakeMessages:
@@ -437,6 +439,11 @@ def test_elevenlabs_drops_stale_feedback_and_reports_playback(tmp_path: Path) ->
     speaker.on_play = lambda text, voice, waited, played: events.append((text, played))
     speaker.say("Sunrise was a tenth quicker.")
     assert speaker.busy()
+    speaker._queue.clear()
+    speaker._speaking = True  # generating audio for a phrase already taken off the queue
+    assert speaker.busy()
+    speaker._speaking = False
+    speaker.say("Sunrise was a tenth quicker.")
     speaker.max_wait_s = -1.0  # everything non-urgent is now "too old"
     assert speaker.play_next() and events == [("Sunrise was a tenth quicker.", False)]
     assert not player.played

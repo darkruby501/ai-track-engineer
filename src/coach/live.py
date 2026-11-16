@@ -29,7 +29,7 @@ import structlog
 
 from src.coach.coaches import CornerAdvisor, HeadCoach, LapPlan, pass_message
 from src.coach.metrics import CornerComparison, CornerMetrics, compare, measure_lap
-from src.coach.pacenotes import Cue, PaceNotes, PassRecord, quick_verdict
+from src.coach.pacenotes import Cue, PaceNotes, PassRecord, quick_verdict, time_words
 from src.coach.reference import Reference
 from src.coach.samples import LapTrace, Sample
 from src.coach.speaker import LogSpeaker
@@ -41,16 +41,20 @@ _log = structlog.get_logger("coach.live")
 WORDS_PER_S = 2.8
 
 
-def say_lap_time(lap_s: float, ref_s: float) -> str:
+def say_lap_time(lap_s: float, best_s: float | None) -> str:
+    """The lap time as said aloud, compared with the driver's best clean lap so far."""
     tenths_total = int(round(lap_s * 10))
     minutes, rest = divmod(tenths_total, 600)
     whole, tenth = divmod(rest, 10)
-    delta = lap_s - ref_s
-    gap = "off" if delta >= 0 else "under"
-    return (
-        f"Lap time {int(minutes)} {whole:02d} point {tenth}, "
-        f"{abs(delta):.1f} seconds {gap} the reference."
-    )
+    said = f"Lap time {int(minutes)} {whole:02d} point {tenth}"
+    if best_s is None:
+        return said + "."
+    delta = lap_s - best_s
+    if delta < -0.05:
+        return f"{said}, a new best by {time_words(delta)}."
+    if delta <= 0.05:
+        return f"{said}, matching your best."
+    return f"{said}, {time_words(delta)} off your best."
 
 
 def speech_seconds(text: str) -> float:
@@ -105,6 +109,7 @@ class LiveCoach:
     _lap_passes: dict[int, int] = field(default_factory=dict)
     _lap_incidents: dict[int, list[str]] = field(default_factory=dict)
     _green_laps: set[int] = field(default_factory=set)
+    _best_clean_s: float | None = None
     plans: list[LapPlan] = field(default_factory=list)
     _log_lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -350,7 +355,6 @@ class LiveCoach:
             return
         lap_s = lap_ms / 1000.0
         ref_s = self.reference.lap_time_s
-        self._queue_say(say_lap_time(lap_s, ref_s), t, max_age_s=30.0, kind="lap-time", front=True)
         flags: list[str] = []
         pit = any(s.in_pit for s in samples)
         if pit:
@@ -359,6 +363,10 @@ class LiveCoach:
         flags += incidents
         if not pit and not incidents and self._lap_passes.get(lap_no, 0) == len(self.corners):
             self._green_laps.add(lap_no)
+            # lap times only for clean laps, against the best clean lap
+            said = say_lap_time(lap_s, self._best_clean_s)
+            self._queue_say(said, t, max_age_s=30.0, kind="lap-time", front=True)
+            self._best_clean_s = min(lap_s, self._best_clean_s or lap_s)
         if self._laps_seen == 1:
             flags.append("first lap seen this session (may be partial or an out-lap)")
         if lap_s > ref_s + 8:

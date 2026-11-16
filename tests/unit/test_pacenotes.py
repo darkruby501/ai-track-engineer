@@ -296,11 +296,14 @@ def test_quick_verdict() -> None:
     verdict = quick_verdict(best, previous, mark)
     assert verdict.startswith("Alpha was") and "quicker than last time" in verdict
     assert verdict.endswith("and you braked right on the mark.")
-    assert [time_words(x) for x in (0.08, -0.3, 0.5, 1.24)] == [
+    assert [time_words(x) for x in (0.08, -0.3, 0.5, 1.24, 1.6, 4.4, 143.7)] == [
         "a tenth",
         "three tenths",
         "half a second",
-        "1.2 seconds",
+        "a second",
+        "a second and a half",
+        "about four seconds",
+        "about 144 seconds",
     ]
     assert quick_verdict(best, PassRecord(1, best, None), None) == ""
     from src.coach.pacenotes import spoken_name

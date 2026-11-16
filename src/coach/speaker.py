@@ -241,6 +241,7 @@ class ElevenLabsSpeaker(LogSpeaker):
         self._prefetch_queue: deque[tuple[str, str]] = deque()
         self._cv = threading.Condition()
         self._busy_until = 0.0
+        self._speaking = False  # between taking a phrase and starting to play it
         self._closed = False
         self._seconds: dict[str, float] = {}
         self.failures = 0
@@ -327,7 +328,7 @@ class ElevenLabsSpeaker(LogSpeaker):
 
     def busy(self) -> bool:
         with self._cv:
-            return bool(self._queue) or time.monotonic() < self._busy_until
+            return bool(self._queue) or self._speaking or time.monotonic() < self._busy_until
 
     def prefetch(self, texts: Iterable[str], *, voice: str = "") -> None:
         with self._cv:
@@ -343,9 +344,12 @@ class ElevenLabsSpeaker(LogSpeaker):
             if not self._queue or time.monotonic() < self._busy_until:
                 return False
             text, voice, queued, urgent = self._queue.popleft()
+            self._speaking = True
         waited = time.monotonic() - queued
         if not urgent and waited > self.max_wait_s:
             _log.info("speech-dropped-stale", text=text, waited_s=round(waited, 2))
+            with self._cv:
+                self._speaking = False
             if self.on_play is not None:
                 self.on_play(text, voice, waited, False)
             return True
@@ -355,11 +359,14 @@ class ElevenLabsSpeaker(LogSpeaker):
             self._player.play(path)
             with self._cv:
                 self._busy_until = time.monotonic() + seconds
+                self._speaking = False
             if self.on_play is not None:
                 self.on_play(text, voice, time.monotonic() - queued, True)
         except Exception as exc:  # noqa: BLE001 - never lose a cue: use the system voice
             self.failures += 1
             _log.warning("elevenlabs-failed", text=text, error=repr(exc))
+            with self._cv:
+                self._speaking = False
             self._fallback.say(text, urgent=True)
         return True
 
