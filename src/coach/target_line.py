@@ -200,6 +200,14 @@ class TargetLine:
     kappa: NDArray[np.float64]
     lap_time_s: float
     margins: NDArray[np.float64] = field(repr=False, default_factory=lambda: np.zeros(0))
+    ai_gas: NDArray[np.float64] = field(repr=False, default_factory=lambda: np.zeros(0))
+    ai_brake: NDArray[np.float64] = field(repr=False, default_factory=lambda: np.zeros(0))
+
+    def pedals(self) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """``(gas, brake)`` flags for the ideal line (from the reference's pedals if known)."""
+        if self.ai_gas.size == self.v.size and self.ai_brake.size == self.v.size:
+            return pedal_flags_from_reference(self.s_spline, self.v, self.ai_gas, self.ai_brake)
+        return pedal_flags(self.s_spline, self.v)
 
     def brake_points(self, spans: list[tuple[str, float, float]]) -> dict[str, float]:
         """Target braking point (spline metres) for corners that need braking.
@@ -284,13 +292,68 @@ def pedal_flags(
             if lost_kmh >= brake_drop_kmh and hard.size:
                 label[a : a + int(hard[-1]) + 1] = 2
         i = j + 1
+    return _flags(_merge_short_runs(label, seg, min_run_m))
+
+
+def _merge_short_runs(
+    label: NDArray[np.int8], seg: NDArray[np.float64], min_run_m: float
+) -> NDArray[np.int8]:
+    """Runs shorter than *min_run_m* take the label before them (no flicker)."""
+    n = len(label)
     start = 0
     for k in range(1, n + 1):
         if k == n or label[k] != label[start]:
             if start > 0 and float(np.sum(seg[start:k])) < min_run_m:
                 label[start:k] = label[start - 1]
             start = k
+    return label
+
+
+def _flags(label: NDArray[np.int8]) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     return (label == 0).astype(np.float64), (label == 2).astype(np.float64)
+
+
+def pedal_flags_from_reference(
+    s: NDArray[np.float64],
+    v: NDArray[np.float64],
+    ai_gas: NDArray[np.float64],
+    ai_brake: NDArray[np.float64],
+    *,
+    gas_on: float = 0.2,
+    brake_on: float = 0.05,
+    reach_m: float = 120.0,
+    min_run_m: float = 12.0,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """``(gas, brake)`` per point from the reference driver's pedals.
+
+    The colours follow the pedals, not the speed: red from each of our
+    (earlier) brake points until the reference releases its brake, green
+    wherever it is on the throttle (in a Miata that is from about turn-in,
+    while the corner still scrubs speed), white where it is off both.
+    """
+    n = len(s)
+    label = np.where(ai_gas > gas_on, 0, 1).astype(np.int8)
+    braking = ai_brake > brake_on
+    label[braking] = 2
+    _, ours = pedal_flags(s, v)
+    on = ours > 0.5
+    for a in np.flatnonzero(on & ~np.roll(on, 1)):
+        k, run_end = int(a), None
+        while (s[k % n] - s[a]) % s[-1] <= reach_m and k < a + n:
+            if braking[k % n]:
+                run_end = k
+                while braking[(run_end + 1) % n] and run_end < a + n:
+                    run_end += 1
+                break
+            k += 1
+        if run_end is None:  # the reference doesn't brake here: keep our own zone
+            k = int(a)
+            while on[k % n] and k < a + n:
+                label[k % n] = 2
+                k += 1
+        else:
+            label[np.arange(a, run_end + 1) % n] = 2
+    return _flags(_merge_short_runs(label, np.r_[np.diff(s), 0.0], min_run_m))
 
 
 def to_ideal_line(spline: AiSpline, target: TargetLine) -> AiSpline:
@@ -301,7 +364,7 @@ def to_ideal_line(spline: AiSpline, target: TargetLine) -> AiSpline:
     pts[:, 3] = np.r_[0.0, np.cumsum(seg)[:-1]]
     extra = spline.extra.copy()
     extra[:, SPEED] = target.v
-    extra[:, GAS], extra[:, BRAKE] = pedal_flags(pts[:, 3], target.v)
+    extra[:, GAS], extra[:, BRAKE] = target.pedals()
     extra[:, RADIUS] = 1.0 / np.maximum(np.abs(target.kappa), 1e-6)
     extra[:, SIDE_L] = spline.extra[:, SIDE_L] + target.offsets
     extra[:, SIDE_R] = spline.extra[:, SIDE_R] - target.offsets
@@ -385,8 +448,10 @@ def monotone_envelope(
         if ref[a] >= ref[b]:  # peak -> trough: slow down, never speed up
             cap[idx] = np.minimum.accumulate(ref[idx] * slow_factor)
         else:  # trough -> peak: speed up, never slow down; the trough's margin
-            # fades out so the next straight ends at full speed (early brake points)
-            fade = np.linspace(1.0, 0.0, len(idx) - 1)
+            # fades out as the reference gains speed, so long corners keep it and
+            # the next straight ends at full speed (early brake points)
+            gain = (ref[idx[1:]] - ref[a]) / max(float(ref[b] - ref[a]), 1e-6)
+            fade = 1.0 - np.clip(gain, 0.0, 1.0)
             out = ref[idx[1:]] - (1.0 - slow_factor) * ref[a] * fade
             cap[idx[1:]] = np.minimum.accumulate(out[::-1])[::-1]
     return cap
@@ -440,6 +505,8 @@ def build_conservative_target(
     ref_s: NDArray[np.float64],
     ref_speed_kmh: NDArray[np.float64],
     car: CarModel,
+    ref_gas: NDArray[np.float64] | None = None,
+    ref_brake: NDArray[np.float64] | None = None,
     half_width_m: float = 0.84,
     base_margin_m: float = 0.3,
     risk_zones: list[tuple[float, float, float]] | None = None,
@@ -456,4 +523,10 @@ def build_conservative_target(
     v = profile_from_reference(s, v_ref, xz, car, corner_speed_factor=corner_speed_factor)
     seg = np.hypot(*(np.roll(xz, -1, axis=0) - xz).T)
     lap = float(np.sum(seg / np.maximum(v, 1.0)))
-    return TargetLine(off, xz, s, v, curvature(xz), lap, margins)
+    pedals = {}
+    if ref_gas is not None and ref_brake is not None:
+        pedals = {
+            "ai_gas": np.interp(s, ref_s, ref_gas),
+            "ai_brake": np.interp(s, ref_s, ref_brake),
+        }
+    return TargetLine(off, xz, s, v, curvature(xz), lap, margins, **pedals)

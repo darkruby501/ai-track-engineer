@@ -19,6 +19,7 @@ from src.coach.target_line import (
     monotone_envelope,
     orient_normals,
     pedal_flags,
+    pedal_flags_from_reference,
     profile_from_reference,
     read_ai_spline,
     speed_profile,
@@ -144,6 +145,23 @@ def test_pedal_flags_one_brake_zone_then_coast() -> None:
     assert coast[(s > 165) & (s < 195)].all()  # white into the apex
     assert not red[(s > 390) & (s < 430)].any()  # a small lift is never red
     assert gas[(s > 230) & (s < 390)].all()
+
+
+def test_pedal_flags_follow_the_reference_pedals() -> None:
+    s = np.arange(0.0, 600.0, 1.5)
+    v = np.full(s.size, 40.0)
+    zone = (s >= 100) & (s < 200)
+    v[zone] = 40.0 - (s[zone] - 100) * 0.18  # our braking starts at 100 m
+    v[s >= 200] = np.minimum(22.0 + (s[s >= 200] - 200) * 0.1, 40.0)
+    ai_gas = np.where((s < 115) | (s > 156), 1.0, 0.0)
+    ai_gas[(s > 300) & (s < 340)] = 0.0  # a real lift
+    ai_brake = np.where((s >= 115) & (s < 150), 0.8, 0.0)  # the AI brakes later
+    gas, brake = pedal_flags_from_reference(s, v, ai_gas, ai_brake)
+    red = brake > 0.5
+    assert red[(s >= 101) & (s < 149)].all()  # from our mark to the AI's release
+    assert gas[(s > 160) & (s < 295)].all()  # throttle from turn-in, speed still falling
+    assert not (gas[(s > 305) & (s < 335)] > 0.5).any()  # white lift
+    assert not red[s > 160].any()
 
 
 def test_build_target_and_ideal_line() -> None:
