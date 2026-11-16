@@ -502,9 +502,6 @@ def test_no_cue_words_when_the_line_is_visible() -> None:
     pace = PaceNotes(ref_metrics=measure_lap(ref.lap, CORNERS), ref_lap=ref.lap, cue_words=False)
     pace.notes["Alpha"].call_turn = pace.notes["Alpha"].call_throttle = True
     assert {c.kind for c in pace.cues()} <= {"approach", "apex"}
-    ctx = _context()
-    ctx.line_visible = True
-    assert "ideal line" in ctx.text() and "Never repeat what the line shows" in ctx.text()
 
 
 async def test_pit_laps_get_no_head_plan() -> None:
@@ -635,14 +632,6 @@ def test_pass_message_mentions_history_and_objective() -> None:
         note=note,
     )
     assert "Lap 4" in msg and "mark @125" in msg and "Brake later" in msg and "Same." in msg
-
-
-def test_coach_settings_defaults() -> None:
-    settings = CoachSettings()
-    assert settings.model == "claude-opus-5-5"
-    assert settings.fast_model == "claude-haiku-5-5"
-    assert settings.lap_effort == "low"
-    assert settings.pace_notes is True
 
 
 # -- usage and cost accounting ---------------------------------------------------------

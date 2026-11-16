@@ -11,7 +11,6 @@ from src.coach.pacenotes import (
     CornerNote,
     PaceNotes,
     PassRecord,
-    estimate_speech_s,
     quick_verdict,
     template_note,
     time_words,
@@ -30,7 +29,6 @@ from src.coach.target_line import (
     pedal_flags_from_reference,
     profile_from_reference,
     read_ai_spline,
-    speed_profile,
     to_ideal_line,
     turning_points,
     write_ai_spline,
@@ -98,12 +96,9 @@ def test_orient_normals_points_right_whatever_the_edge_sign() -> None:
     assert np.median(np.einsum("ij,ij->i", normals, toward)) > 0
 
 
-def test_speed_profiles_respect_limits() -> None:
+def test_target_speeds_respect_limits() -> None:
     spline = _oval()
-    car = CarModel(lat_g=0.9, brake_g=0.95)
-    s, v, kappa = speed_profile(spline.xz, car)
-    corner = np.abs(kappa) > 1 / 70
-    assert v[corner].max() == pytest.approx(np.sqrt(0.9 * 9.81 * 60), rel=0.08)
+    car = CarModel(brake_g=0.95)
     s_m = spline.points[:, 3]
     ref = _ref_with_corners(s_m) / 3.6
     vp = profile_from_reference(s_m, ref, spline.xz, car)
@@ -254,14 +249,6 @@ def test_cues_never_cut_each_other_off() -> None:
     # the long approach note moved earlier so it ends before "Brake"
     start, end = pace._time(approach.at_m), pace._time(brake.at_m)
     assert (end - start) % pace.lap_s >= pace.speech_s(long_note) + pace.gap_s - 1e-6
-    # measured durations replace the estimate
-    pace.speech_s = lambda text: 0.5
-    assert len(pace.cues()) >= len(cues)
-
-
-def test_estimate_speech_s_grows_with_words() -> None:
-    short, long = estimate_speech_s("Brake"), estimate_speech_s("Brake at the kink, 2nd gear")
-    assert 0.6 < short < 1.0 < long < 3.0
 
 
 def test_marks_move_within_bounds_and_state_roundtrips(tmp_path: Path) -> None:

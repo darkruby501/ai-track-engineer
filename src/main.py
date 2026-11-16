@@ -168,7 +168,6 @@ def coach_target_line(
         Path | None, typer.Option(help="Track folder (default: AC install).")
     ] = None,
     base_margin_m: float = typer.Option(0.3, help="Wheel margin inside the edges, metres."),
-    lat_g: float = typer.Option(0.9, help="Cornering grip used for target speeds."),
     brake_g: float = typer.Option(0.95, help="Braking used for target braking points."),
 ) -> None:
     """Build the conservative target line, marks and an AC ideal-line file."""
@@ -204,7 +203,7 @@ def coach_target_line(
         ref_speed_kmh=reference.lap.speed,
         ref_gas=reference.lap.gas,
         ref_brake=reference.lap.brake,
-        car=CarModel(lat_g=lat_g, brake_g=brake_g),
+        car=CarModel(brake_g=brake_g),
         base_margin_m=base_margin_m,
         risk_zones=DEFAULT_RISK_ZONES.get((track, layout), []),
     )
@@ -221,7 +220,7 @@ def coach_target_line(
             )
             for name, a, b in spans
         },
-        "settings": {"base_margin_m": base_margin_m, "lat_g": lat_g, "brake_g": brake_g},
+        "settings": {"base_margin_m": base_margin_m, "brake_g": brake_g},
     }
     (out_dir / f"{stem}__target.json").write_text(json.dumps(payload, indent=1), encoding="utf-8")
     write_ai_spline(to_ideal_line(spline, target), out_dir / f"{stem}__ideal_line.ai")

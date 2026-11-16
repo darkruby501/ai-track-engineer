@@ -1,18 +1,18 @@
-"""A conservative target line: smoothest path with safety margins, plus speeds.
+"""A conservative target line and the AC ideal line drawn from it.
 
 Starting from the track's AI spline (``ai/fast_lane.ai``, which also stores each
 point's distance to the left and right track edges), we
 
-1. pick a lateral offset at every point that minimises the line's curvature
-   (a bounded linear least-squares problem), keeping the car's wheels a chosen
-   margin inside both edges - more margin where going off is costly;
-2. compute a speed profile on that line with a simple point-mass model
-   (cornering grip, braking and power-limited acceleration, combined with a
-   friction ellipse), using grip *below* what the car can do; and
-3. read the target braking points off the speed profile.
+1. keep the AI's line but nudge it inward wherever the wheels would come closer
+   to an edge than a chosen margin - more margin where going off is costly;
+2. take target speeds from the reference AI lap: about 5% slower into each
+   slow point, braking no harder than ``CarModel.brake_g``, smoothed so each
+   corner has one slow-down and one speed-up;
+3. read the brake marks off those speeds, and colour the line by the
+   reference driver's pedals (red brake, green throttle, white coast).
 
-The result can be written back in AC's ``.ai`` format as ``data/ideal_line.ai``
-so AC's "ideal line" assist (Ctrl+I) draws it on track.
+The result is written back in AC's ``.ai`` format as ``data/ideal_line.ai`` so
+AC's "ideal line" assist (Ctrl+I) draws it on track.
 """
 
 from __future__ import annotations
@@ -23,8 +23,6 @@ from pathlib import Path
 
 import numpy as np
 from numpy.typing import NDArray
-from scipy import sparse
-from scipy.optimize import lsq_linear
 
 G = 9.81
 SPEED, GAS, BRAKE, RADIUS, SIDE_L, SIDE_R, LENGTH_X = 0, 1, 2, 4, 5, 6, 12
@@ -104,34 +102,6 @@ def orient_normals(spline: AiSpline, edges_right_xz: NDArray[np.float64]) -> NDA
     return normals if np.median(agree) > 0 else -normals
 
 
-def optimise_offsets(
-    spline: AiSpline,
-    normals: NDArray[np.float64],
-    *,
-    half_width_m: float,
-    wheel_margin_m: NDArray[np.float64],
-) -> NDArray[np.float64]:
-    """Lateral offsets (metres, + = right) giving the least-curvature closed line."""
-    n = spline.n
-    keep = half_width_m + wheel_margin_m
-    lo = -(spline.extra[:, SIDE_L] - keep)
-    hi = spline.extra[:, SIDE_R] - keep
-    bad = lo > hi  # track too narrow for the margin: centre it
-    mid = (lo + hi) / 2
-    lo = np.where(bad, mid - 1e-3, lo)
-    hi = np.where(bad, mid + 1e-3, hi)
-    # Second-difference operator on a closed loop.
-    rows = np.repeat(np.arange(n), 3)
-    cols = np.c_[(np.arange(n) - 1) % n, np.arange(n), (np.arange(n) + 1) % n].ravel()
-    vals = np.tile([1.0, -2.0, 1.0], n)
-    d2 = sparse.csr_matrix((vals, (rows, cols)), shape=(n, n))
-    xz = spline.xz
-    a = sparse.vstack([d2 @ sparse.diags(normals[:, 0]), d2 @ sparse.diags(normals[:, 1])])
-    b = -np.r_[d2 @ xz[:, 0], d2 @ xz[:, 1]]
-    result = lsq_linear(a, b, bounds=(lo, hi), method="trf", lsmr_tol="auto", max_iter=500)
-    return np.asarray(result.x, dtype=np.float64)
-
-
 def curvature(xz: NDArray[np.float64], smooth: int = 5) -> NDArray[np.float64]:
     """Signed curvature of a closed polyline (1/m)."""
 
@@ -151,7 +121,6 @@ def curvature(xz: NDArray[np.float64], smooth: int = 5) -> NDArray[np.float64]:
 
 @dataclass
 class CarModel:
-    lat_g: float = 0.9  # usable cornering grip
     brake_g: float = 0.95  # usable braking
     top_speed_kmh: float = 195.0
     # Full-throttle acceleration (g) by speed (km/h), measured from the AI lap.
@@ -160,35 +129,6 @@ class CarModel:
 
     def accel_at(self, v_ms: float) -> float:
         return float(np.interp(v_ms * 3.6, self.accel_speeds, self.accel_g)) * G
-
-
-def speed_profile(
-    xz: NDArray[np.float64], car: CarModel, *, laps: int = 3
-) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]]:
-    """``(s, v m/s, curvature)`` along a closed line, by a forward/backward pass."""
-    seg = np.hypot(*(np.roll(xz, -1, axis=0) - xz).T)
-    s = np.r_[0.0, np.cumsum(seg)[:-1]]
-    kappa = curvature(xz)
-    a_lat = car.lat_g * G
-    v_corner = np.sqrt(a_lat / np.maximum(np.abs(kappa), 1e-6))
-    v_cap = np.minimum(v_corner, car.top_speed_kmh / 3.6)
-    n = len(xz)
-    v = v_cap.copy()
-    for _ in range(laps):  # forward: power- and grip-limited acceleration
-        for i in range(n):
-            j = (i + 1) % n
-            lat = v[i] ** 2 * abs(kappa[i])
-            room = max(0.0, 1.0 - (lat / a_lat) ** 2) ** 0.5
-            acc = min(car.accel_at(v[i]), car.brake_g * G * room)
-            v[j] = min(v[j], (v[i] ** 2 + 2 * acc * seg[i]) ** 0.5)
-    for _ in range(laps):  # backward: braking within the friction ellipse
-        for i in range(n - 1, -1, -1):
-            j = (i + 1) % n
-            lat = v[j] ** 2 * abs(kappa[j])
-            room = max(0.0, 1.0 - (lat / a_lat) ** 2) ** 0.5
-            dec = car.brake_g * G * room
-            v[i] = min(v[i], (v[j] ** 2 + 2 * dec * seg[i]) ** 0.5)
-    return s, v, kappa
 
 
 @dataclass
@@ -227,29 +167,6 @@ class TargetLine:
             if owner is not None and owner not in out:
                 out[owner] = float(self.s_spline[a])
         return out
-
-
-def build_target_line(
-    spline: AiSpline,
-    edges_right_xz: NDArray[np.float64],
-    *,
-    car: CarModel,
-    half_width_m: float = 0.84,
-    base_margin_m: float = 0.3,
-    risk_zones: list[tuple[float, float, float]] | None = None,
-) -> TargetLine:
-    """Optimise a line and its speeds. ``risk_zones``: (from_m, to_m, wheel margin)."""
-    s_spline = spline.points[:, 3]
-    margins = np.full(spline.n, base_margin_m)
-    for a, b, m in risk_zones or []:
-        margins = np.where((s_spline >= a) & (s_spline <= b), np.maximum(margins, m), margins)
-    normals = orient_normals(spline, edges_right_xz)
-    offsets = optimise_offsets(spline, normals, half_width_m=half_width_m, wheel_margin_m=margins)
-    xz = spline.xz + normals * offsets[:, None]
-    _, v, kappa = speed_profile(xz, car)
-    seg = np.hypot(*(np.roll(xz, -1, axis=0) - xz).T)
-    lap_time = float(np.sum(seg / np.maximum(v, 1.0)))
-    return TargetLine(offsets, xz, s_spline, v, kappa, lap_time, margins)
 
 
 def pedal_flags(
